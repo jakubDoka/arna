@@ -1,13 +1,15 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
+#[cfg(feature = "std")]
+use core::cell::UnsafeCell;
 use core::{
     alloc::Layout,
     cell::Cell,
     marker::{PhantomData, PhantomPinned},
     mem::{MaybeUninit, transmute},
-    ops::Deref,
+    ops::{Deref, DerefMut},
     pin::Pin,
-    ptr::{NonNull, copy_nonoverlapping},
+    ptr::{NonNull, copy_nonoverlapping, drop_in_place},
 };
 
 use core::ptr::slice_from_raw_parts_mut;
@@ -40,15 +42,24 @@ impl<'a> Deref for Checkpoint<'a> {
     }
 }
 
-impl Drop for Checkpoint<'_> {
-    fn drop(&mut self) {
-        let arna: &Arna = self.deref();
-        arna.pos.set(self.prev_pos);
-        arna.depth.update(|d| d - 1);
+pub fn panicking() -> bool {
+    cfg_select! {
+        feature = "std" => std::thread::panicking(),
+        _ => false,
     }
 }
 
-#[derive(Default)]
+impl Drop for Checkpoint<'_> {
+    fn drop(&mut self) {
+        if !panicking() {
+            let arna: &Arna = self.deref();
+            arna.pos.set(self.prev_pos);
+            arna.depth.update(|d| d - 1);
+        }
+    }
+}
+
+#[derive(Default, Debug)]
 pub struct Arna<'a> {
     pos: Cell<usize>,
     commited: Cell<usize>,
@@ -58,6 +69,42 @@ pub struct Arna<'a> {
 
     borrow: PhantomData<&'a mut [u8]>,
     _unpin: PhantomPinned,
+}
+
+pub struct OwnedSlice<T>([T]);
+
+impl<T> DerefMut for OwnedSlice<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<T> Deref for OwnedSlice<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T> OwnedSlice<T> {
+    pub unsafe fn from_slice(slice: &mut [T]) -> &mut OwnedSlice<T> {
+        unsafe { transmute(slice) }
+    }
+}
+
+impl<'a, T: Copy> Into<&'a mut [T]> for &'a mut OwnedSlice<T> {
+    fn into(self) -> &'a mut [T] {
+        return &mut self.0;
+    }
+}
+
+impl<T> Drop for OwnedSlice<T> {
+    fn drop(&mut self) {
+        unsafe {
+            drop_in_place(&mut self.0);
+        }
+    }
 }
 
 #[repr(usize)]
@@ -70,8 +117,16 @@ pub enum BackingMode {
     Box = 2,
 }
 
+#[cfg(feature = "std")]
+thread_local! {
+    static TEMP_ARENAS: UnsafeCell<[Arna<'static>; 2]> = Default::default();
+}
+
 impl<'a> Arna<'a> {
     pub fn backing_mode(&self) -> BackingMode {
+        if self.cap == 0 {
+            return BackingMode::Slice;
+        }
         let vl = (self.commited.get() as isize - self.cap as isize).max(0);
         debug_assert!(vl < 3);
         unsafe { transmute(vl) }
@@ -92,9 +147,8 @@ impl<'a> Arna<'a> {
         self.pos.set(0);
     }
 
-    pub fn checkpoit(self: Pin<&Self>) -> Checkpoint<'a> {
-        assert!(self.depth.get() == 0);
-        unsafe { self.checkpoit_unchecked() }
+    pub fn checkpoit(self: Pin<&mut Self>) -> Checkpoint<'a> {
+        unsafe { self.as_ref().checkpoit_unchecked() }
     }
 
     pub unsafe fn checkpoit_unchecked(self: Pin<&Self>) -> Checkpoint<'a> {
@@ -106,16 +160,16 @@ impl<'a> Arna<'a> {
         }
     }
 
-    pub fn alloc_copy<T: Copy>(&self, value: &[T]) -> &mut [T] {
+    pub fn alloc_copy<T>(&self, value: &[T]) -> &mut [T] {
         let alloc = self.alloc_uninit(value.len());
-        unsafe { copy_nonoverlapping(value.as_ptr(), alloc.as_ptr() as _, value.len()) };
+        unsafe { copy_nonoverlapping(value.as_ptr(), alloc.as_mut_ptr() as _, value.len()) };
         unsafe { alloc.assume_init_mut() }
     }
 
-    pub fn alloc_default<T: Default>(&self, len: usize) -> &mut [T] {
+    pub fn alloc_default<T: Default>(&self, len: usize) -> &mut OwnedSlice<T> {
         let alloc = self.alloc_uninit(len);
         alloc.fill_with(|| MaybeUninit::new(T::default()));
-        unsafe { alloc.assume_init_mut() }
+        unsafe { OwnedSlice::from_slice(alloc.assume_init_mut()) }
     }
 
     pub fn alloc_uninit<T>(&self, len: usize) -> &mut [MaybeUninit<T>] {
@@ -124,11 +178,6 @@ impl<'a> Arna<'a> {
             .expect("OOM");
         unsafe { slice::from_raw_parts_mut(ptr.as_ptr() as _, len) }
     }
-
-    #[cfg(feature = "virtual")]
-    const COMMIT_CHUNK: usize = 1024 * 1024;
-    #[cfg(feature = "virtual")]
-    const PAGE_SIZE: usize = 1 << 16;
 
     pub fn alloc_raw(&self, layout: Layout) -> Result<NonNull<u8>, OOM> {
         let curr = unsafe { self.ptr.add(self.pos.get()) };
@@ -139,14 +188,16 @@ impl<'a> Arna<'a> {
 
         #[cfg(feature = "virtual")]
         if self.pos.get() > self.commited.get() {
-            let to_reserve = (self.commited.get() + Self::COMMIT_CHUNK)
+            let to_reserve = (self.commited.get() + Arna::COMMIT_CHUNK)
                 .max(self.pos.get())
                 .min(self.cap);
-            let to_reserve = (to_reserve + Self::PAGE_SIZE - 1) & (Self::PAGE_SIZE - 1);
+            let to_reserve = (to_reserve + Arna::PAGE_SIZE - 1) & !(Arna::PAGE_SIZE - 1);
+            assert!(to_reserve != 0);
             unsafe {
                 use core::slice::from_raw_parts_mut;
                 virtual_mem::commit(from_raw_parts_mut(self.ptr, to_reserve))?
             };
+            self.commited.set(to_reserve);
         }
 
         if self.pos.get() > self.cap {
@@ -170,6 +221,24 @@ impl From<virtual_mem::Error> for OOM {
 
 #[cfg(feature = "virtual")]
 impl Arna<'static> {
+    const COMMIT_CHUNK: usize = 1024 * 1024;
+    const PAGE_SIZE: usize = 1 << 16;
+
+    pub fn scratch<'a>(clobber: impl Into<Option<&'a Arna<'static>>>) -> Checkpoint<'static> {
+        let clobber = clobber.into();
+        TEMP_ARENAS.with(|arenas| {
+            let refr = unsafe { &*arenas.get() };
+            for vl in refr {
+                use core::ptr::null;
+
+                if vl as *const _ != clobber.map_or(null(), |v| v as _) {
+                    return unsafe { Pin::new_unchecked(vl).checkpoit_unchecked() };
+                }
+            }
+            unreachable!()
+        })
+    }
+
     pub fn new_virtual(cap: usize) -> Result<Self, virtual_mem::Error> {
         assert!(cap % Self::PAGE_SIZE == 0);
         let mem = virtual_mem::reserve(cap)?;
@@ -182,6 +251,56 @@ impl Arna<'static> {
             borrow: PhantomData,
             _unpin: PhantomPinned,
         })
+    }
+
+    pub fn init_temp_arenas(slots: [Arna<'static>; 2]) {
+        // SAFETY: the drop of the previous arenas will panic if any checkpoints are still
+        // active
+        TEMP_ARENAS.with(|old_slots| unsafe { *old_slots.get() = slots })
+    }
+
+    pub fn init_bulk<const COUNT: usize>(
+        caps: [usize; COUNT],
+    ) -> Result<[Arna<'static>; COUNT], virtual_mem::Error> {
+        let mut arnas: [MaybeUninit<Arna<'static>>; COUNT] =
+            [const { MaybeUninit::uninit() }; COUNT];
+
+        assert!(caps.iter().all(|v| v % Self::PAGE_SIZE == 0));
+
+        let total_cap = caps.iter().sum::<usize>();
+        let mut mem = virtual_mem::reserve(total_cap)?;
+
+        for (arna, cap) in arnas.iter_mut().zip(caps) {
+            use core::ptr::slice_from_raw_parts_mut;
+
+            arna.write(Arna {
+                pos: 0.into(),
+                commited: 0.into(),
+                ptr: mem as _,
+                cap,
+                depth: 0.into(),
+                borrow: PhantomData,
+                _unpin: PhantomPinned,
+            });
+
+            mem = unsafe { slice_from_raw_parts_mut((mem as *mut u8).add(cap), mem.len() - cap) };
+        }
+
+        Ok(unsafe { arnas.map(|v| v.assume_init()) })
+    }
+}
+
+impl<'a> From<&'a mut [u8]> for Arna<'a> {
+    fn from(value: &'a mut [u8]) -> Self {
+        Arna {
+            ptr: value.as_mut_ptr() as _,
+            cap: value.len(),
+            commited: Cell::new(value.len() + BackingMode::Slice as usize),
+            pos: 0.into(),
+            depth: 0.into(),
+            borrow: PhantomData,
+            _unpin: PhantomPinned,
+        }
     }
 }
 
@@ -217,7 +336,10 @@ impl From<alloc::boxed::Box<[MaybeUninit<u8>]>> for Arna<'static> {
 
 impl Drop for Arna<'_> {
     fn drop(&mut self) {
-        assert!(self.depth.get() == 0, "all checkpoins need to be dropped");
+        assert!(
+            panicking() || self.depth.get() == 0,
+            "all checkpoins need to be dropped"
+        );
         let _mem = slice_from_raw_parts_mut(self.ptr, self.cap);
         match self.backing_mode() {
             #[cfg(feature = "virtual")]
@@ -231,6 +353,87 @@ impl Drop for Arna<'_> {
             #[cfg(feature = "alloc")]
             BackingMode::Box => unsafe { drop(alloc::boxed::Box::from_raw(_mem)) },
         }
+    }
+}
+
+#[cfg(test)]
+pub mod tests {
+    use core::pin::pin;
+
+    use crate::Arna;
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn temp_arenas() {
+        use core::mem::MaybeUninit;
+
+        Arna::init_temp_arenas([
+            Arna::from(Box::from_iter([MaybeUninit::<u8>::uninit(); 1024])),
+            Arna::from(Box::from_iter([MaybeUninit::<u8>::uninit(); 1024])),
+        ]);
+
+        let check = Arna::scratch(None);
+
+        let vl = check.alloc_default::<u8>(16);
+
+        let check_2 = Arna::scratch(&*check);
+        let mem = {
+            let _check_3 = Arna::scratch(&*check_2);
+
+            let mem = _check_3.alloc_default::<u8>(16);
+
+            let mem = check_2.alloc_copy(mem);
+            mem.fill(10);
+            mem
+        };
+
+        check.alloc_default::<u8>(16).fill(40);
+        vl.fill(10);
+        mem.fill(11);
+    }
+
+    #[test]
+    #[should_panic]
+    fn invariat_crash_() {
+        let mut buf = [0; 1024];
+        let check = {
+            let arena = pin!(Arna::from(&mut buf[..]));
+
+            _ = arena.alloc_default::<usize>(16);
+
+            arena.checkpoit()
+        };
+
+        _ = check.alloc_default::<u8>(16);
+    }
+
+    #[test]
+    #[should_panic]
+    fn invariat_crash() {
+        let mut buf = [0; 1024];
+
+        let arena = pin!(Arna::from(&mut buf[..]));
+
+        _ = arena.alloc_default::<usize>(16);
+
+        let check = arena.checkpoit();
+
+        _ = check.alloc_default::<u8>(16);
+        let _check_2 = check.checkpoit();
+
+        _ = check.alloc_default::<u8>(16);
+    }
+
+    #[test]
+    fn virtual_meme() {
+        Arna::init_temp_arenas(Arna::init_bulk([1024 * 1024 * 8; 2]).expect("brahm"));
+
+        let check = Arna::scratch(None);
+
+        let mem = check.alloc_default::<u8>(1024 * 1024 + 1);
+        mem.fill(1);
+
+        drop(check);
     }
 }
 
@@ -535,6 +738,7 @@ pub mod virtual_mem {
     compile_error!("the virtual feature only supports Linux, Windows, and macOS");
 
     #[cfg(test)]
+    #[cfg(not(miri))]
     mod tests {
         use super::{commit, decommit, release, reserve};
 

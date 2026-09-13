@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 
 [features]
-default = ["alloc", "virtual"]
+default = ["alloc", "virtual", "std"]
 std = ["alloc"]
 alloc = []
 virtual = []
