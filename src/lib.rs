@@ -111,7 +111,7 @@ impl<T> Drop for OwnedSlice<T> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackingMode {
     #[cfg(feature = "virtual")]
-    Mmap = 0,
+    Virtual = 0,
     Slice = 1,
     #[cfg(feature = "alloc")]
     Box = 2,
@@ -136,7 +136,7 @@ impl<'a> Arna<'a> {
     pub fn clear_and_decommit(&mut self) {
         // SAFETY: the checkpoits can only be created from the pinned arena, that means we
         // cant call this
-        assert_eq!(self.backing_mode(), BackingMode::Mmap);
+        assert_eq!(self.backing_mode(), BackingMode::Virtual);
         unsafe {
             use core::slice::from_raw_parts_mut;
 
@@ -195,7 +195,10 @@ impl<'a> Arna<'a> {
             assert!(to_reserve != 0);
             unsafe {
                 use core::slice::from_raw_parts_mut;
-                virtual_mem::commit(from_raw_parts_mut(self.ptr, to_reserve))?
+                virtual_mem::commit(from_raw_parts_mut(
+                    self.ptr.add(self.commited.get()),
+                    to_reserve - self.commited.get(),
+                ))?
             };
             self.commited.set(to_reserve);
         }
@@ -222,6 +225,7 @@ impl From<virtual_mem::Error> for OOM {
 #[cfg(feature = "virtual")]
 impl Arna<'static> {
     const COMMIT_CHUNK: usize = 1024 * 1024;
+    // NOTE: shoud cover all platforms, eventhough overdoing it on some
     const PAGE_SIZE: usize = 1 << 16;
 
     pub fn scratch<'a>(clobber: impl Into<Option<&'a Arna<'static>>>) -> Checkpoint<'static> {
@@ -242,15 +246,7 @@ impl Arna<'static> {
     pub fn new_virtual(cap: usize) -> Result<Self, virtual_mem::Error> {
         assert!(cap % Self::PAGE_SIZE == 0);
         let mem = virtual_mem::reserve(cap)?;
-        Ok(Arna {
-            ptr: mem as _,
-            cap: mem.len(),
-            commited: 0.into(),
-            pos: 0.into(),
-            depth: 0.into(),
-            borrow: PhantomData,
-            _unpin: PhantomPinned,
-        })
+        Ok(unsafe { Arna::new(mem as _, BackingMode::Virtual) })
     }
 
     pub fn init_temp_arenas(slots: [Arna<'static>; 2]) {
@@ -266,24 +262,31 @@ impl Arna<'static> {
             [const { MaybeUninit::uninit() }; COUNT];
 
         assert!(caps.iter().all(|v| v % Self::PAGE_SIZE == 0));
+        cfg_select! {
+            target_os = "windows" => {
+                // Windows sucks in this regard, it does not let us free arbitrary ranges of
+                // the allocation
+                for (arna, cap) in arnas.iter_mut().zip(caps) {
+                    arna.write(unsafe { Arna::new_virtual(cap)? });
+                }
+            },
+            _ => {
+                let total_cap = caps.iter().sum::<usize>();
+                let mut mem = virtual_mem::reserve(total_cap)?;
 
-        let total_cap = caps.iter().sum::<usize>();
-        let mut mem = virtual_mem::reserve(total_cap)?;
+                for (arna, cap) in arnas.iter_mut().zip(caps) {
+                    use core::ptr::slice_from_raw_parts_mut;
 
-        for (arna, cap) in arnas.iter_mut().zip(caps) {
-            use core::ptr::slice_from_raw_parts_mut;
+                    arna.write(unsafe {
+                        Arna::new(
+                            slice_from_raw_parts_mut(mem as _, cap),
+                            BackingMode::Virtual,
+                        )
+                    });
 
-            arna.write(Arna {
-                pos: 0.into(),
-                commited: 0.into(),
-                ptr: mem as _,
-                cap,
-                depth: 0.into(),
-                borrow: PhantomData,
-                _unpin: PhantomPinned,
-            });
-
-            mem = unsafe { slice_from_raw_parts_mut((mem as *mut u8).add(cap), mem.len() - cap) };
+                    mem = unsafe { slice_from_raw_parts_mut((mem as *mut u8).add(cap), mem.len() - cap) };
+                }
+            },
         }
 
         Ok(unsafe { arnas.map(|v| v.assume_init()) })
@@ -292,40 +295,33 @@ impl Arna<'static> {
 
 impl<'a> From<&'a mut [u8]> for Arna<'a> {
     fn from(value: &'a mut [u8]) -> Self {
-        Arna {
-            ptr: value.as_mut_ptr() as _,
-            cap: value.len(),
-            commited: Cell::new(value.len() + BackingMode::Slice as usize),
-            pos: 0.into(),
-            depth: 0.into(),
-            borrow: PhantomData,
-            _unpin: PhantomPinned,
-        }
+        unsafe { Arna::new(value as *mut _ as *mut _, BackingMode::Slice) }
     }
 }
 
 impl<'a> From<&'a mut [MaybeUninit<u8>]> for Arna<'a> {
     fn from(value: &'a mut [MaybeUninit<u8>]) -> Self {
-        Arna {
-            ptr: value.as_mut_ptr() as _,
-            cap: value.len(),
-            commited: Cell::new(value.len() + BackingMode::Slice as usize),
-            pos: 0.into(),
-            depth: 0.into(),
-            borrow: PhantomData,
-            _unpin: PhantomPinned,
-        }
+        unsafe { Arna::new(value, BackingMode::Box) }
     }
 }
 
 #[cfg(feature = "alloc")]
 impl From<alloc::boxed::Box<[MaybeUninit<u8>]>> for Arna<'static> {
     fn from(value: alloc::boxed::Box<[MaybeUninit<u8>]>) -> Self {
-        let value = alloc::boxed::Box::leak(value);
+        unsafe { Arna::new(alloc::boxed::Box::leak(value), BackingMode::Slice) }
+    }
+}
+
+impl Arna<'static> {
+    /// If you are unsure how to use this, use `new_virtual` or From imps
+    pub unsafe fn new(mem: *mut [MaybeUninit<u8>], mode: BackingMode) -> Self {
         Arna {
-            ptr: value.as_mut_ptr() as _,
-            cap: value.len(),
-            commited: Cell::new(value.len() + BackingMode::Box as usize),
+            ptr: mem as _,
+            cap: mem.len(),
+            commited: Cell::new(match mode {
+                BackingMode::Virtual => 0,
+                _ => mem.len() + mode as usize,
+            }),
             pos: 0.into(),
             depth: 0.into(),
             borrow: PhantomData,
@@ -343,7 +339,7 @@ impl Drop for Arna<'_> {
         let _mem = slice_from_raw_parts_mut(self.ptr, self.cap);
         match self.backing_mode() {
             #[cfg(feature = "virtual")]
-            BackingMode::Mmap => unsafe {
+            BackingMode::Virtual => unsafe {
                 virtual_mem::release(_mem as _).expect(
                     "the release has no reason to fail considering \
                     the invariants of the object",
@@ -419,6 +415,7 @@ pub mod tests {
         let check = arena.checkpoit();
 
         _ = check.alloc_default::<u8>(16);
+
         let _check_2 = check.checkpoit();
 
         _ = check.alloc_default::<u8>(16);
@@ -433,7 +430,9 @@ pub mod tests {
         let mem = check.alloc_default::<u8>(1024 * 1024 + 1);
         mem.fill(1);
 
-        drop(check);
+        let check2 = Arna::scratch(&*check);
+        let mem = check2.alloc_default::<u8>(1024 * 1024 + 1);
+        mem.fill(1);
     }
 }
 
