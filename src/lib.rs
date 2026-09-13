@@ -9,7 +9,7 @@ use core::{
     mem::{MaybeUninit, transmute},
     ops::{Deref, DerefMut},
     pin::Pin,
-    ptr::{NonNull, copy_nonoverlapping, drop_in_place},
+    ptr::{NonNull, copy_nonoverlapping, drop_in_place, null},
 };
 
 use core::ptr::slice_from_raw_parts_mut;
@@ -26,19 +26,50 @@ pub struct Checkpoint<'a> {
 }
 
 impl<'a> Checkpoint<'a> {
-    pub fn checkpoit(&self) -> Self {
-        let arna: &Arna = self.deref();
-        unsafe { Pin::new_unchecked(arna).checkpoit_unchecked() }
+    /// # PANICS
+    ///
+    /// When you allocate to the parent before dropping the return value.
+    pub fn checkpoint(&self) -> Self {
+        let arna = unsafe { self.get_inner() };
+        unsafe { Pin::new_unchecked(arna).checkpoint_ref() }
     }
-}
 
-impl<'a> Deref for Checkpoint<'a> {
-    type Target = Arna<'a>;
-
-    fn deref(&self) -> &Self::Target {
+    /// # SAFETY
+    ///
+    /// Not safe to keep this ref around while allocating from other checkpoints as the depht
+    /// check is performed here, so on your own risk, but it does allow you to avoid the
+    /// repeated checks
+    pub unsafe fn get_inner(&self) -> &Arna<'a> {
         let arna = unsafe { self.arna.as_ref() };
         assert_eq!(self.depth, arna.depth.get());
         arna
+    }
+
+    pub fn create<T>(&self, value: T) -> &mut T {
+        self.create_uninit().write(value)
+    }
+
+    pub fn create_uninit<T>(&self) -> &mut MaybeUninit<T> {
+        unsafe { self.alloc_uninit(1).get_unchecked_mut(0) }
+    }
+
+    pub fn alloc<T>(&self, value: &[T]) -> &mut [T] {
+        let alloc = self.alloc_uninit(value.len());
+        unsafe { copy_nonoverlapping(value.as_ptr(), alloc.as_mut_ptr() as _, value.len()) };
+        unsafe { alloc.assume_init_mut() }
+    }
+
+    pub fn alloc_default<T: Default>(&self, len: usize) -> &mut OwnedSlice<T> {
+        let alloc = self.alloc_uninit(len);
+        alloc.fill_with(|| MaybeUninit::new(T::default()));
+        unsafe { OwnedSlice::from_slice(alloc.assume_init_mut()) }
+    }
+
+    pub fn alloc_uninit<T>(&self, len: usize) -> &mut [MaybeUninit<T>] {
+        let ptr = unsafe { self.get_inner() }
+            .alloc_raw(Layout::array::<T>(len).expect("bad layout"))
+            .expect("OOM");
+        unsafe { slice::from_raw_parts_mut(ptr.as_ptr() as _, len) }
     }
 }
 
@@ -52,23 +83,11 @@ pub fn panicking() -> bool {
 impl Drop for Checkpoint<'_> {
     fn drop(&mut self) {
         if !panicking() {
-            let arna: &Arna = self.deref();
+            let arna = unsafe { self.get_inner() };
             arna.pos.set(self.prev_pos);
             arna.depth.update(|d| d - 1);
         }
     }
-}
-
-#[derive(Default, Debug)]
-pub struct Arna<'a> {
-    pos: Cell<usize>,
-    commited: Cell<usize>,
-    ptr: *mut u8,
-    cap: usize,
-    depth: Cell<usize>,
-
-    borrow: PhantomData<&'a mut [u8]>,
-    _unpin: PhantomPinned,
 }
 
 pub struct OwnedSlice<T>([T]);
@@ -117,6 +136,19 @@ pub enum BackingMode {
     Box = 2,
 }
 
+/// Arna is just the memory owner, to allocate use [`Self::checkpoint`]
+#[derive(Default, Debug)]
+pub struct Arna<'a> {
+    pos: Cell<usize>,
+    commited: Cell<usize>,
+    ptr: *mut u8,
+    cap: usize,
+    depth: Cell<usize>,
+
+    borrow: PhantomData<&'a mut [u8]>,
+    _unpin: PhantomPinned,
+}
+
 #[cfg(feature = "std")]
 thread_local! {
     static TEMP_ARENAS: UnsafeCell<[Arna<'static>; 2]> = Default::default();
@@ -134,7 +166,7 @@ impl<'a> Arna<'a> {
 
     #[cfg(feature = "virtual")]
     pub fn clear_and_decommit(&mut self) {
-        // SAFETY: the checkpoits can only be created from the pinned arena, that means we
+        // SAFETY: the checkpoints can only be created from the pinned arena, that means we
         // cant call this
         assert_eq!(self.backing_mode(), BackingMode::Virtual);
         unsafe {
@@ -147,36 +179,17 @@ impl<'a> Arna<'a> {
         self.pos.set(0);
     }
 
-    pub fn checkpoit(self: Pin<&mut Self>) -> Checkpoint<'a> {
-        unsafe { self.as_ref().checkpoit_unchecked() }
+    pub fn checkpoint(self: Pin<&mut Self>) -> Checkpoint<'a> {
+        self.as_ref().checkpoint_ref()
     }
 
-    pub unsafe fn checkpoit_unchecked(self: Pin<&Self>) -> Checkpoint<'a> {
+    pub fn checkpoint_ref(self: Pin<&Self>) -> Checkpoint<'a> {
         self.depth.update(|d| d + 1);
         Checkpoint {
             arna: self.get_ref().into(),
             depth: self.depth.get(),
             prev_pos: self.pos.get(),
         }
-    }
-
-    pub fn alloc_copy<T>(&self, value: &[T]) -> &mut [T] {
-        let alloc = self.alloc_uninit(value.len());
-        unsafe { copy_nonoverlapping(value.as_ptr(), alloc.as_mut_ptr() as _, value.len()) };
-        unsafe { alloc.assume_init_mut() }
-    }
-
-    pub fn alloc_default<T: Default>(&self, len: usize) -> &mut OwnedSlice<T> {
-        let alloc = self.alloc_uninit(len);
-        alloc.fill_with(|| MaybeUninit::new(T::default()));
-        unsafe { OwnedSlice::from_slice(alloc.assume_init_mut()) }
-    }
-
-    pub fn alloc_uninit<T>(&self, len: usize) -> &mut [MaybeUninit<T>] {
-        let ptr = self
-            .alloc_raw(Layout::array::<T>(len).expect("bad layout"))
-            .expect("OOM");
-        unsafe { slice::from_raw_parts_mut(ptr.as_ptr() as _, len) }
     }
 
     pub fn alloc_raw(&self, layout: Layout) -> Result<NonNull<u8>, OOM> {
@@ -222,21 +235,35 @@ impl From<virtual_mem::Error> for OOM {
     }
 }
 
+pub trait IntoClobber {
+    fn address(self) -> *const ();
+}
+
+impl IntoClobber for i32 {
+    fn address(self) -> *const () {
+        null()
+    }
+}
+
+impl IntoClobber for &'_ Checkpoint<'_> {
+    fn address(self) -> *const () {
+        self.arna.as_ptr() as _
+    }
+}
+
 #[cfg(feature = "virtual")]
 impl Arna<'static> {
     const COMMIT_CHUNK: usize = 1024 * 1024;
     // NOTE: shoud cover all platforms, eventhough overdoing it on some
     const PAGE_SIZE: usize = 1 << 16;
 
-    pub fn scratch<'a>(clobber: impl Into<Option<&'a Arna<'static>>>) -> Checkpoint<'static> {
-        let clobber = clobber.into();
+    pub fn scratch<'a>(clobber: impl IntoClobber) -> Checkpoint<'static> {
+        let clobber = clobber.address();
         TEMP_ARENAS.with(|arenas| {
             let refr = unsafe { &*arenas.get() };
             for vl in refr {
-                use core::ptr::null;
-
-                if vl as *const _ != clobber.map_or(null(), |v| v as _) {
-                    return unsafe { Pin::new_unchecked(vl).checkpoit_unchecked() };
+                if vl as *const _ as *const _ != clobber {
+                    return unsafe { Pin::new_unchecked(vl).checkpoint_ref() };
                 }
             }
             unreachable!()
@@ -368,17 +395,17 @@ pub mod tests {
             Arna::from(Box::from_iter([MaybeUninit::<u8>::uninit(); 1024])),
         ]);
 
-        let check = Arna::scratch(None);
+        let check = Arna::scratch(0);
 
         let vl = check.alloc_default::<u8>(16);
 
-        let check_2 = Arna::scratch(&*check);
+        let check_2 = Arna::scratch(&check);
         let mem = {
-            let _check_3 = Arna::scratch(&*check_2);
+            let _check_3 = Arna::scratch(&check_2);
 
             let mem = _check_3.alloc_default::<u8>(16);
 
-            let mem = check_2.alloc_copy(mem);
+            let mem = check_2.alloc(mem);
             mem.fill(10);
             mem
         };
@@ -393,11 +420,13 @@ pub mod tests {
     fn invariat_crash_() {
         let mut buf = [0; 1024];
         let check = {
-            let arena = pin!(Arna::from(&mut buf[..]));
+            let mut arena = pin!(Arna::from(&mut buf[..]));
 
-            _ = arena.alloc_default::<usize>(16);
+            let check = arena.as_mut().checkpoint();
 
-            arena.checkpoit()
+            _ = check.alloc_default::<usize>(16);
+
+            arena.checkpoint()
         };
 
         _ = check.alloc_default::<u8>(16);
@@ -410,13 +439,11 @@ pub mod tests {
 
         let arena = pin!(Arna::from(&mut buf[..]));
 
-        _ = arena.alloc_default::<usize>(16);
-
-        let check = arena.checkpoit();
+        let check = arena.checkpoint();
 
         _ = check.alloc_default::<u8>(16);
 
-        let _check_2 = check.checkpoit();
+        let _check_2 = check.checkpoint();
 
         _ = check.alloc_default::<u8>(16);
     }
@@ -425,12 +452,12 @@ pub mod tests {
     fn virtual_meme() {
         Arna::init_temp_arenas(Arna::init_bulk([1024 * 1024 * 8; 2]).expect("brahm"));
 
-        let check = Arna::scratch(None);
+        let check = Arna::scratch(0);
 
         let mem = check.alloc_default::<u8>(1024 * 1024 + 1);
         mem.fill(1);
 
-        let check2 = Arna::scratch(&*check);
+        let check2 = Arna::scratch(&check);
         let mem = check2.alloc_default::<u8>(1024 * 1024 + 1);
         mem.fill(1);
     }

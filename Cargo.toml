@@ -2,6 +2,8 @@
 name = "arna"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "Collection of handmade libraries."
 
 [dependencies]
 
