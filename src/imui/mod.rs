@@ -1,5 +1,5 @@
 use {
-    crate::Checkpoint,
+    crate::{Checkpoint, SimdSearchIter},
     alloc::{string::String, vec::Vec},
     core::{
         cell::{Cell, Ref, RefCell, RefMut},
@@ -7,6 +7,7 @@ use {
         mem::transmute,
         ops::{Index, IndexMut},
         ptr::{NonNull, null},
+        slice,
     },
 };
 
@@ -33,6 +34,7 @@ pub struct TextCmdData {
     pub y: f32,
     pub size: f32,
     pub spacing: f32,
+    pub line_spacing: f32,
     pub content: TextId,
     pub font: FontId,
     pub color: Color,
@@ -133,19 +135,6 @@ pub trait BackendBase {
     fn get_font_base_size(&mut self, font: FontId) -> f32;
     fn get_glypy_data(&mut self, font: FontId, ch: char) -> Option<Glyph>;
 
-    fn line_height(
-        &mut self,
-        _: FontId,
-        font_size: f32,
-        mut line_scaling: f32,
-    ) -> f32 {
-        if line_scaling == 0. {
-            line_scaling = 1.;
-        }
-
-        return font_size * line_scaling;
-    }
-
     fn glyph_advance(&mut self, font: FontId, ch: char, font_size: f32) -> f32 {
         let Some(glyph) = self.get_glypy_data(font, ch) else { return 0. };
 
@@ -161,13 +150,6 @@ pub trait BackendBase {
 }
 
 pub trait Backend {
-    fn line_height(
-        &mut self,
-        font: FontId,
-        font_size: f32,
-        line_scaling: f32,
-    ) -> f32;
-
     fn find_line_boundary(
         &mut self,
         font: FontId,
@@ -190,15 +172,6 @@ impl<B> BackendFromBase<B> {
 }
 
 impl<B: BackendBase> Backend for BackendFromBase<B> {
-    fn line_height(
-        &mut self,
-        font: FontId,
-        font_size: f32,
-        line_scaling: f32,
-    ) -> f32 {
-        self.0.line_height(font, font_size, line_scaling)
-    }
-
     fn find_line_boundary(
         &mut self,
         font: FontId,
@@ -248,6 +221,7 @@ pub struct Ctx {
     current_elem: Cell<ElemIdx>,
     style: Cell<Style>,
     pub hovered: Vec<ElemIdx>,
+    pub measure_cache: MeasureCache,
 }
 
 impl Ctx {
@@ -287,12 +261,12 @@ impl Ctx {
     }
 
     #[cfg(feature = "std")]
-    pub fn cmds<'a, 'b>(
+    pub fn cmds<'a>(
         &mut self,
         backend: &mut impl BackendBase,
-        scratch: &'a Checkpoint<'b>,
+        scratch: &'a Checkpoint,
         input_state: InputState,
-    ) -> Vec<DrawCmd, &'a Checkpoint<'b>> {
+    ) -> &'a mut [DrawCmd] {
         let arna = crate::Arna::scratch(scratch);
         self.cmds_ext(
             BackendFromBase::new(backend),
@@ -302,13 +276,13 @@ impl Ctx {
         )
     }
 
-    pub fn cmds_ext<'a, 'b>(
+    pub fn cmds_ext<'a>(
         &mut self,
         backend: &mut dyn Backend,
-        scratch: &'a Checkpoint<'b>,
+        scratch: &'a Checkpoint,
         arna: &Checkpoint,
         input_state: InputState,
-    ) -> Vec<DrawCmd, &'a Checkpoint<'b>> {
+    ) -> &'a mut [DrawCmd] {
         #[derive(Clone, Copy, PartialEq, Eq)]
         enum Order {
             Pre,
@@ -339,6 +313,7 @@ impl Ctx {
         struct Extra {
             used_y: f32,
             used_x: f32,
+            text_hash: u32,
             line: u16,
         }
 
@@ -366,29 +341,6 @@ impl Ctx {
             }
         }
 
-        self.current_elem.take();
-        self.parent.take();
-        self.frames.swap(0, 1);
-        self.frames[0].get_mut().elemets.truncate(1);
-        self.frames[0].get_mut().text.buf.clear();
-
-        let frame = self.frames[1].get_mut();
-
-        for elem in &mut frame.elemets {
-            for (sdim, edim) in
-                elem.style.dims.iter_mut().zip(elem.dims.iter_mut())
-            {
-                if let Size::Fixed(size) = sdim.size.to_size() {
-                    edim.size = size;
-                }
-                edim.size = f32::max(edim.size, sdim.min_size);
-                edim.size = f32::max(edim.size, sdim.padding_sum());
-            }
-        }
-
-        let root = ElemIdx(1);
-        let extra = ExtraArr::from(arna.alloc_default(frame.elemets.len()));
-
         fn get_text_params(
             ctx: &FrameCtx,
             root: ElemIdx,
@@ -405,11 +357,31 @@ impl Ctx {
 
         fn measure_text(
             ctx: &FrameCtx,
+            extra: &ExtraArr,
+            cache: &mut MeasureCache,
             backend: &mut dyn Backend,
             root: ElemIdx,
             max_width: f32,
-        ) -> [f32; 2] {
-            measure_text_ext(ctx, backend, root, max_width, &mut |_, _, _| {})
+        ) -> [f32; DIMS] {
+            let node = &ctx[root];
+
+            cache.get_or_insert(
+                node.style.text.len,
+                MeasureCacheKey {
+                    text_hash: extra[root].text_hash,
+                    elem_id: node.id,
+                    max_width,
+                },
+                &mut || {
+                    measure_text_ext(
+                        ctx,
+                        backend,
+                        root,
+                        max_width,
+                        &mut |_, _, _| {},
+                    )
+                },
+            )
         }
 
         fn measure_text_ext(
@@ -418,9 +390,11 @@ impl Ctx {
             root: ElemIdx,
             mut max_width: f32,
             with_chunk: &mut dyn FnMut(TextId, f32, f32),
-        ) -> [f32; 2] {
+        ) -> [f32; DIMS] {
+            let r = &ctx[root];
+
             if max_width == 0. {
-                max_width = ctx[root].inner_size(0)
+                max_width = r.inner_size(0)
             }
 
             if let Some((font, full_text)) = get_text_params(ctx, root) {
@@ -428,19 +402,16 @@ impl Ctx {
                 let mut width = 0.;
                 let mut height = 0.;
 
-                let line_height = backend.line_height(
-                    font,
-                    ctx[root].style.font_size,
-                    ctx[root].style.line_height_mult,
-                );
+                let line_height = r.style.font_size;
+                let mut line_spacing = 0.;
 
                 while text.as_str().len() != 0 {
                     let prev_len = text.as_str().len();
                     let line_width = backend.find_line_boundary(
                         font,
                         &mut text,
-                        ctx[root].style.font_size,
-                        ctx[root].style.font_spacing,
+                        r.style.font_size,
+                        r.style.font_spacing,
                         max_width,
                     );
                     width = line_width.max(width);
@@ -449,7 +420,7 @@ impl Ctx {
                     assert!(curr_len < prev_len, "{:?}", &text.as_str()[..10]);
 
                     with_chunk(
-                        ctx[root].style.text.slice(
+                        r.style.text.slice(
                             full_text.len() - prev_len,
                             full_text.len() - curr_len,
                         ),
@@ -457,7 +428,8 @@ impl Ctx {
                         line_width,
                     );
 
-                    height += line_height;
+                    height += line_spacing + line_height;
+                    line_spacing = r.style.font_line_spacing;
                 }
 
                 [width, height]
@@ -466,7 +438,46 @@ impl Ctx {
             }
         }
 
-        traverse(frame, root, Order::Post, &mut |ctx, root| match ctx[root]
+        self.current_elem.take();
+        self.parent.take();
+        self.frames.swap(0, 1);
+        self.frames[0].get_mut().elemets.truncate(1);
+        self.frames[0].get_mut().text.buf.clear();
+
+        let ctx = self.frames[1].get_mut();
+        let extra =
+            ExtraArr::from(arna.alloc_default(ctx.elemets.len()).unwrap());
+
+        for (elem, extra) in ctx.elemets.iter_mut().zip(&mut extra.0) {
+            extra.text_hash = fnv1a(ctx.text.get(elem.style.text).as_bytes());
+
+            for (sdim, edim) in
+                elem.style.dims.iter_mut().zip(elem.dims.iter_mut())
+            {
+                if let Size::Fixed(size) = sdim.size.to_size() {
+                    edim.size = size;
+                }
+                edim.size = f32::max(edim.size, sdim.min_size);
+                edim.size = f32::max(edim.size, sdim.padding_sum());
+            }
+        }
+
+        macro_rules! measure_text {
+            ($ctx:expr, $node:expr, $width:expr) => {
+                measure_text(
+                    $ctx,
+                    &extra,
+                    &mut self.measure_cache,
+                    backend,
+                    $node,
+                    $width,
+                )
+            };
+        }
+
+        let root = ElemIdx(1);
+
+        traverse(ctx, root, Order::Post, &mut |ctx, root| match ctx[root]
             .style
             .layout
         {
@@ -482,9 +493,8 @@ impl Ctx {
                     }
                 }
 
-                for (d, s) in measure_text(ctx, backend, root, f32::MAX)
-                    .into_iter()
-                    .enumerate()
+                for (d, s) in
+                    measure_text!(ctx, root, f32::MAX).into_iter().enumerate()
                 {
                     if ctx[root].style.dims[d].size.is_fit() {
                         ctx[root].dims[d].size = f32::max(
@@ -496,7 +506,7 @@ impl Ctx {
             }
         });
 
-        traverse(frame, root, Order::Pre, &mut |ctx, root| {
+        traverse(ctx, root, Order::Pre, &mut |ctx, root| {
             let [x, y] = ctx[root].style.direction.dims();
             match ctx[root].style.layout {
                 Layout::Flex => {
@@ -514,8 +524,7 @@ impl Ctx {
                                 * p;
 
                             if y == 0 {
-                                let [_, h] =
-                                    measure_text(ctx, backend, child, 0.);
+                                let [_, h] = measure_text!(ctx, child, 0.);
 
                                 ctx[child].dims[x].size = f32::max(
                                     ctx[child].dims[x].size,
@@ -585,7 +594,7 @@ impl Ctx {
             }
         });
 
-        traverse(frame, root, Order::Post, &mut |ctx, root| {
+        traverse(ctx, root, Order::Post, &mut |ctx, root| {
             let [x, y] = ctx[root].style.direction.dims();
 
             match ctx[root].style.layout {
@@ -628,7 +637,7 @@ impl Ctx {
                     for ((d, max), td) in [x, y]
                         .into_iter()
                         .zip([max_x, max_y])
-                        .zip(measure_text(ctx, backend, root, 0.))
+                        .zip(measure_text!(ctx, root, 0.))
                     {
                         if ctx[root].style.dims[d].size.is_fit() {
                             ctx[root].dims[d].size = f32::max(max, td)
@@ -639,7 +648,7 @@ impl Ctx {
             }
         });
 
-        traverse(frame, root, Order::Pre, &mut |ctx, root| {
+        traverse(ctx, root, Order::Pre, &mut |ctx, root| {
             let [x, y] = ctx[root].style.direction.dims();
 
             match ctx[root].style.layout {
@@ -697,15 +706,15 @@ impl Ctx {
             }
         });
 
-        let mut order = Vec::with_capacity_in(frame.elemets.len(), &arna);
+        let mut order = Vec::with_capacity_in(ctx.elemets.len(), &arna);
 
-        traverse(frame, root, Order::Pre, &mut |_, root| order.push(root));
+        traverse(ctx, root, Order::Pre, &mut |_, root| order.push(root));
 
         self.hovered.clear();
 
         let mut buf = Vec::new_in(scratch);
         for &n in &order {
-            let node = frame[n];
+            let node = ctx[n];
 
             // NOTE: this will collect all overlaps, the last overlap has the highest
             // priority since is't the top most element.
@@ -731,14 +740,16 @@ impl Ctx {
                 });
             }
 
-            if let Some((font, _)) = get_text_params(frame, n) {
-                let [_, y] = measure_text(frame, backend, n, 0.);
+            if let Some((font, _)) = get_text_params(ctx, n) {
+                let [_, y] = measure_text!(ctx, n, 0.);
+
                 measure_text_ext(
-                    frame,
+                    ctx,
                     backend,
                     n,
                     0.,
                     &mut |content, y_off, width| {
+                        // TODO: check bounds and skip this if possible
                         buf.push(DrawCmd {
                             elem: n,
                             data: DrawCmdData::Text(TextCmdData {
@@ -753,11 +764,12 @@ impl Ctx {
                                         .align
                                         .offset(node.inner_size(1) - y)
                                     + y_off,
-                                size: frame[n].style.font_size,
-                                spacing: frame[n].style.font_spacing,
+                                size: ctx[n].style.font_size,
+                                spacing: ctx[n].style.font_spacing,
+                                line_spacing: ctx[n].style.font_line_spacing,
                                 content,
                                 font,
-                                color: frame[n].style.fg_color,
+                                color: ctx[n].style.fg_color,
                             }),
                         });
                     },
@@ -765,18 +777,127 @@ impl Ctx {
             }
         }
 
-        buf
+        buf.leak()
     }
 }
 
-pub struct StyleScope<'b> {
-    pub ctx: &'b Ctx,
-    pub prev: Style,
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MeasureCacheKey {
+    pub text_hash: u32,
+    pub elem_id: ElemID,
+    pub max_width: f32,
 }
 
-impl Drop for StyleScope<'_> {
-    fn drop(&mut self) {
-        self.ctx.style.set(self.prev);
+impl MeasureCacheKey {
+    pub fn hash(&self) -> u8 {
+        (fnv1a(unsafe {
+            slice::from_raw_parts(
+                self as *const _ as *const u8,
+                core::mem::size_of::<Self>(),
+            )
+        }) as u8)
+            .max(1)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MeasureCacheEntry {
+    pub key: MeasureCacheKey,
+    pub dims: [f32; DIMS],
+    pub priority: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct MeasureCache {
+    hashes: [u8; Self::CAP],
+    entries: [MeasureCacheEntry; Self::CAP],
+    hits: u64,
+    len: usize,
+}
+
+impl MeasureCache {
+    const CAP: usize = 64;
+    const MIN_LEN_TO_CACHE: u32 = 32;
+
+    pub fn prune(&mut self) {
+        assert!(self.len < self.entries.len());
+
+        // TODO: we could do better but eh
+        let mut keep = 0;
+        for i in 0..self.len {
+            if self.hits & 1 << i != 0 {
+                self.entries[keep] = self.entries[i];
+                self.hashes[keep] = self.hashes[i];
+                keep += 1;
+            }
+        }
+        self.len = keep;
+
+        self.hits = 0;
+    }
+
+    pub fn get_or_insert(
+        &mut self,
+        len: u32,
+        key: MeasureCacheKey,
+        measure: &mut dyn FnMut() -> [f32; DIMS],
+    ) -> [f32; DIMS] {
+        assert!(self.len < self.entries.len());
+
+        if len < Self::MIN_LEN_TO_CACHE {
+            return measure();
+        }
+
+        let hash = key.hash();
+
+        let idx = match SimdSearchIter::new(&self.hashes[..], hash)
+            .find(|&i| self.entries[i].key == key)
+        {
+            Some(idx) => idx,
+            None => {
+                let dims = measure();
+
+                let idx = if self.len == self.entries.len() {
+                    let (min_prio, min_idx) = self
+                        .entries
+                        .iter()
+                        .enumerate()
+                        .map(|(i, e)| (e.priority, i))
+                        .min()
+                        .expect("we are full, so there needs to be somethin");
+
+                    if min_prio > len {
+                        return dims;
+                    }
+
+                    min_idx
+                } else {
+                    self.len += 1;
+                    self.len - 1
+                };
+
+                self.hashes[idx] = hash;
+                self.entries[idx] =
+                    MeasureCacheEntry { key, dims, priority: len };
+
+                idx
+            }
+        };
+
+        self.hits |= 1 << idx;
+
+        self.entries[idx].dims
+    }
+}
+
+impl Default for MeasureCache {
+    fn default() -> Self {
+        Self {
+            hashes: [Default::default(); Self::CAP],
+            entries: [Default::default(); Self::CAP],
+            len: Default::default(),
+            hits: Default::default(),
+        }
     }
 }
 
@@ -858,7 +979,7 @@ impl Index<ElemIdx> for FrameCtx {
 impl FrameCtx {
     pub fn add_elem(&mut self, elem: Elem) -> ElemIdx {
         self.elemets.push(elem);
-        ElemIdx((self.elemets.len() - 1) as u16)
+        ElemIdx((self.elemets.len() - 1) as u32)
     }
 }
 
@@ -878,7 +999,7 @@ impl From<i32> for ElemID {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
-pub struct ElemIdx(pub u16);
+pub struct ElemIdx(pub u32);
 
 pub struct ElemBuilder<'b> {
     pub ctx: &'b Ctx,
@@ -1063,6 +1184,17 @@ macro_rules! derive_style_builder {
     (@ $field_type:ty) => {$field_type};
 }
 
+pub struct StyleScope<'b> {
+    pub ctx: &'b Ctx,
+    pub prev: Style,
+}
+
+impl Drop for StyleScope<'_> {
+    fn drop(&mut self) {
+        self.ctx.style.set(self.prev);
+    }
+}
+
 derive_style_builder! {
     #[derive(Clone, Copy, Default, Debug)]
     pub struct Style {
@@ -1080,7 +1212,7 @@ derive_style_builder! {
         pub font: Option<FontId>,
         pub font_size: f32,
         pub font_spacing: f32,
-        pub line_height_mult: f32,
+        pub font_line_spacing: f32,
     }
 }
 
@@ -1228,7 +1360,7 @@ pub enum Direction {
 }
 
 impl Direction {
-    pub fn dims(self) -> [usize; 2] {
+    pub fn dims(self) -> [usize; DIMS] {
         match self {
             Direction::Left2Right => [0, 1],
             Direction::Top2Bottom => [1, 0],

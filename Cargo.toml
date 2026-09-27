@@ -7,6 +7,9 @@ description = "Collection of handmade libraries."
 
 [dependencies]
 
+[profile.release]
+debug = true
+
 [features]
 default = ["alloc", "virtual", "std"]
 std = ["alloc"]

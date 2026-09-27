@@ -14,36 +14,51 @@ use core::{
     slice,
 };
 
-//pub fn lex(root) {
-//    let modules = Mods::new(); // locked
-//    let queu = Queue::new();
-//    queu.push(Task::new(root));
-//    let queue_ref = threads::broadcast(&queu):
-//    let mods_ref = threads::broadcast(&modules);
-//
-//    while let Some(task) = queue_ref.next() {
-//        {
-//            let lexed = lex_file(task);
-//            for import in &mut lexed {
-//                let (link, is_new) = mods_ref.get_or_insert_module(task.from, import.path)
-//                    .unwrap().link();
-//                import.link = link;
-//                if is_new {
-//                    queue_ref.push(Task::new(link));
-//                }
-//            }
-//        }
-//
-//        task.mark_done();
-//    }
-//
-//    thread::barier();
-//}
-
 #[cfg(feature = "std")]
 pub mod dynlib;
 #[cfg(feature = "alloc")]
 pub mod imui;
+
+pub mod simd {
+    cfg_select! {
+        target_feature = "avx2" => {
+            pub const SIZE: usize = 32;
+
+            #[inline(always)]
+            pub unsafe fn cmp(needle: u8, haystack: *const u8) -> i32 {
+                unsafe {
+                    use core::arch::x86_64::*;
+                    let haystack =
+                        _mm256_loadu_si256(haystack as *const __m256i);
+                    let needle_vec = _mm256_set1_epi8(u8::cast_signed(needle));
+                    let eq = _mm256_cmpeq_epi8(needle_vec, haystack);
+                    _mm256_movemask_epi8(eq)
+                }
+            }
+        }
+        target_feature = "sse2" => {
+            pub const SIZE: usize = 16;
+
+            #[inline(always)]
+            pub unsafe fn cmp(needle: u8, haystack: *const u8) -> i32 {
+                unsafe {
+                    use core::arch::x86_64::*;
+                    let haystack = _mm_loadu_si128(haystack as *const __m128i);
+                    let needle_vec = _mm_set1_epi8(u8::cast_signed(needle));
+                    let eq = _mm_cmpeq_epi8(needle_vec, haystack);
+                    _mm_movemask_epi8(eq)
+                }
+            }
+        }
+        _ => {
+            pub const SIZE: usize = 1;
+
+            pub unsafe fn cmp(needle: u8, haystack: *const u8) -> i32 {
+                (unsafe { haystack.read() } == needle) as i32
+            }
+        }
+    }
+}
 
 #[macro_export]
 macro_rules! aformat {
@@ -144,7 +159,7 @@ impl<'a> Checkpoint<'a> {
         unsafe { self.alloc_uninit(1).get_unchecked_mut(0) }
     }
 
-    pub fn alloc<T>(&self, value: &[T]) -> &mut [T] {
+    pub fn alloc<T: Copy>(&self, value: &[T]) -> &mut [T] {
         let alloc = self.alloc_uninit(value.len());
         unsafe {
             copy_nonoverlapping(
@@ -156,7 +171,22 @@ impl<'a> Checkpoint<'a> {
         unsafe { alloc.assume_init_mut() }
     }
 
-    pub fn alloc_default<T: Default>(&self, len: usize) -> &mut OwnedSlice<T> {
+    pub fn alloc_clone<'b, T: Clone>(
+        &'b self,
+        value: &[T],
+    ) -> OwnedSlice<'b, T> {
+        let alloc = self.alloc_uninit(value.len());
+        // NOTE: we leak memory if we panic, but eh?
+        for (entry, value) in alloc.iter_mut().zip(value) {
+            entry.write(value.clone());
+        }
+        unsafe { OwnedSlice::from_slice(alloc.assume_init_mut()) }
+    }
+
+    pub fn alloc_default<'b, T: Default>(
+        &'b self,
+        len: usize,
+    ) -> OwnedSlice<'b, T> {
         let alloc = self.alloc_uninit(len);
         alloc.fill_with(|| MaybeUninit::new(T::default()));
         unsafe { OwnedSlice::from_slice(alloc.assume_init_mut()) }
@@ -193,15 +223,15 @@ impl Drop for Checkpoint<'_> {
     }
 }
 
-pub struct OwnedSlice<T>([T]);
+pub struct OwnedSlice<'a, T>(&'a mut [T]);
 
-impl<T> DerefMut for OwnedSlice<T> {
+impl<'a, T> DerefMut for OwnedSlice<'a, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
 
-impl<T> Deref for OwnedSlice<T> {
+impl<'a, T> Deref for OwnedSlice<'a, T> {
     type Target = [T];
 
     fn deref(&self) -> &Self::Target {
@@ -209,22 +239,38 @@ impl<T> Deref for OwnedSlice<T> {
     }
 }
 
-impl<T> OwnedSlice<T> {
-    pub unsafe fn from_slice(slice: &mut [T]) -> &mut OwnedSlice<T> {
+impl<'a, T> OwnedSlice<'a, T> {
+    /// # Safety
+    ///
+    /// The input slice must actually own the contents, or in other words,
+    /// the T would otherwise get leaked if this conversion did not happen.
+    pub unsafe fn from_slice(slice: &'a mut [T]) -> OwnedSlice<'a, T> {
         unsafe { transmute(slice) }
     }
-}
 
-impl<'a, T: Copy> Into<&'a mut [T]> for &'a mut OwnedSlice<T> {
-    fn into(self) -> &'a mut [T] {
-        return &mut self.0;
+    pub fn unwrap(self) -> &'a mut [T]
+    where
+        T: Copy,
+    {
+        self.leak()
+    }
+
+    pub fn leak(self) -> &'a mut [T] {
+        let vl = MaybeUninit::new(self);
+        return unsafe { vl.as_ptr().cast::<&'a mut [T]>().read() };
     }
 }
 
-impl<T> Drop for OwnedSlice<T> {
+impl<'a, T: Copy> Into<&'a mut [T]> for OwnedSlice<'a, T> {
+    fn into(self) -> &'a mut [T] {
+        self.leak()
+    }
+}
+
+impl<'a, T> Drop for OwnedSlice<'a, T> {
     fn drop(&mut self) {
         unsafe {
-            drop_in_place(&mut self.0);
+            drop_in_place(self.0);
         }
     }
 }
@@ -477,7 +523,7 @@ impl<'a> From<&'a mut [MaybeUninit<u8>]> for Arna<'a> {
 #[cfg(feature = "alloc")]
 impl From<alloc::boxed::Box<[MaybeUninit<u8>]>> for Arna<'static> {
     fn from(value: alloc::boxed::Box<[MaybeUninit<u8>]>) -> Self {
-        unsafe { Arna::new(alloc::boxed::Box::leak(value), BackingMode::Slice) }
+        unsafe { Arna::new(alloc::boxed::Box::leak(value), BackingMode::Box) }
     }
 }
 
@@ -611,9 +657,75 @@ unsafe impl<'a> Allocator for Checkpoint<'a> {
     }
 }
 
+pub struct SimdSearchIter<'a, T> {
+    data: &'a [T],
+    needle: T,
+    index: usize,
+    mask: u32,
+}
+
+impl<'a, T: Copy> SimdSearchIter<'a, T> {
+    pub fn new(data: &'a [T], needle: T) -> Self {
+        assert!(data.len() % simd::SIZE == 0);
+        const { assert!(std::mem::size_of::<T>() == 1) };
+        Self { data, needle, mask: 0, index: 0 }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl<'a, T: Copy> SimdSearchIter<'a, T> {}
+
+impl<'a, T: Copy> Iterator for SimdSearchIter<'a, T> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.mask != 0 {
+                let idx = self.mask.trailing_zeros() as usize;
+                self.mask &= self.mask - 1;
+                return Some((self.index - 1) * simd::SIZE + idx);
+            }
+
+            if self.index * simd::SIZE == self.data.len() {
+                return None;
+            }
+
+            self.mask = unsafe {
+                i32::cast_unsigned(simd::cmp(
+                    core::mem::transmute_copy(&self.needle),
+                    self.data.as_ptr().add(self.index * simd::SIZE).cast(),
+                ))
+            };
+            self.index += 1
+        }
+    }
+}
+
 #[cfg(test)]
 pub mod tests {
-    use {crate::Arna, core::pin::pin};
+    use {
+        crate::{Arna, SimdSearchIter},
+        core::pin::pin,
+    };
+
+    #[test]
+    fn test_simd() {
+        let bytes =
+            b"0123456789abcdefghijklmnopqrstuvwxyz-!?*(){}&abc================";
+
+        let mut iter = SimdSearchIter::new(bytes, b'0');
+        assert_eq!(iter.next(), Some(0));
+        assert_eq!(iter.next(), None);
+
+        let mut iter = SimdSearchIter::new(bytes, b'l');
+        assert_eq!(iter.next(), Some(21));
+        assert_eq!(iter.next(), None);
+
+        let mut iter = SimdSearchIter::new(bytes, b'a');
+        assert_eq!(iter.next(), Some(10));
+        assert_eq!(iter.next(), Some(45));
+        assert_eq!(iter.next(), None);
+    }
 
     #[cfg(feature = "alloc")]
     #[test]
@@ -625,27 +737,29 @@ pub mod tests {
             Arna::from(Box::from_iter([MaybeUninit::<u8>::uninit(); 1024])),
         ]);
 
-        let check = Arna::scratch(0);
+        {
+            let check = Arna::scratch(0);
 
-        let vl = check.alloc_default::<u8>(16);
+            let vl = check.alloc_default::<u8>(16).unwrap();
 
-        let check_2 = Arna::scratch(&check);
-        let mem = {
-            let _check_3 = Arna::scratch(&check_2);
+            let check_2 = Arna::scratch(&check);
+            let mem = {
+                let _check_3 = Arna::scratch(&check_2);
 
-            let mem = _check_3.alloc_default::<u8>(16);
+                let mem = _check_3.alloc_default::<u8>(16).unwrap();
 
-            let mem = check_2.alloc(mem);
-            mem.fill(10);
+                let mem = check_2.alloc(mem);
+                mem.fill(10);
 
-            assert_eq!(aformat!(check_2, "foob {}", 10), "foob 10");
+                assert_eq!(aformat!(check_2, "foob {}", 10), "foob 10");
 
-            mem
-        };
+                mem
+            };
 
-        check.alloc_default::<u8>(16).fill(40);
-        vl.fill(10);
-        mem.fill(11);
+            check.alloc_default::<u8>(16).fill(40);
+            vl.fill(10);
+            mem.fill(11);
+        }
     }
 
     #[test]
@@ -681,6 +795,7 @@ pub mod tests {
         _ = check.alloc_default::<u8>(16);
     }
 
+    #[cfg(not(miri))]
     #[test]
     fn virtual_meme() {
         Arna::init_temp_arenas(
@@ -689,11 +804,11 @@ pub mod tests {
 
         let check = Arna::scratch(0);
 
-        let mem = check.alloc_default::<u8>(1024 * 1024 + 1);
+        let mem: &mut [u8] = check.alloc_default::<u8>(1024 * 1024 + 1).into();
         mem.fill(1);
 
         let check2 = Arna::scratch(&check);
-        let mem = check2.alloc_default::<u8>(1024 * 1024 + 1);
+        let mem: &mut [u8] = check2.alloc_default::<u8>(1024 * 1024 + 1).into();
         mem.fill(1);
     }
 }

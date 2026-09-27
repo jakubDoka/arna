@@ -3,9 +3,9 @@ use {
         Arna, TEMP_ARENAS, TempArenas, aformat,
         dynlib::DynamicLibrary,
         imui::{
-            Align, BLUE, BackendBase, BackendFromBase, Ctx,
-            Direction::Top2Bottom, DrawCmdData, FontId, GREEN, Glyph,
-            InputState, Layout::Flex, RED, RectCmdData, TextCmdData, WHITE,
+            Align, BLUE, BackendBase, Color, Ctx, Direction::Top2Bottom,
+            DrawCmdData, FontId, GREEN, Glyph, InputState, Layout::Flex, RED,
+            RectCmdData, TextCmdData, WHITE,
         },
     },
     core::{
@@ -14,8 +14,7 @@ use {
         mem::{MaybeUninit, transmute},
     },
     std::{
-        ffi::CString, path::PathBuf, ptr::NonNull, sync::atomic::AtomicPtr,
-        time::SystemTime,
+        path::PathBuf, ptr::NonNull, sync::atomic::AtomicPtr, time::SystemTime,
     },
 };
 
@@ -174,27 +173,127 @@ unsafe extern "C" {
     pub fn get_screen_width() -> i32;
     #[link_name = "GetScreenHeight"]
     pub fn get_screen_height() -> i32;
-    #[link_name = "GetGlyphIndex"]
-    pub fn get_glyph_index(font: Font, ch: char) -> i32;
     #[link_name = "GetFontDefault"]
     pub fn get_font_default() -> Font;
-    #[link_name = "DrawTextEx"]
-    fn draw_text_ex(
-        font: Font,
-        text: *const i8,
-        position: [f32; 2],
-        fontSize: f32,
-        spacing: f32,
+    #[link_name = "DrawTexturePro"]
+    pub fn draw_texture_pro(
+        texture: RaylibTexture,
+        source: RaylibRectangle,
+        dest: RaylibRectangle,
+        origin: [f32; 2],
+        rotation: f32,
         tint: RaylibColor,
     );
 }
 
+pub struct IndexedFont {
+    font: Font,
+    index: Vec<u8>,
+}
+
+// TODO: this only works because the char count in default font is % 16
+pub fn char_hash(char: char) -> u8 {
+    arna::imui::mix_u32(char as u32, 0) as u8
+}
+
+pub fn get_glyph_index(font: &IndexedFont, char: char) -> Option<usize> {
+    arna::SimdSearchIter::new(&font.index, char_hash(char))
+        .find(|&idx| unsafe { (*font.font.glyphs.add(idx)).value == char })
+}
+
+pub fn draw_text_ex(
+    font: &IndexedFont,
+    text: &str,
+    position: [f32; 2],
+    font_size: f32,
+    spacing: f32,
+    line_spacing: f32,
+    tint: RaylibColor,
+) {
+    let mut text_offset_y = 0.0;
+    let mut text_offset_x = 0.0;
+
+    let scale_factor = font_size / font.font.base_size as f32;
+
+    for codepoint in text.chars() {
+        let Some(index) = get_glyph_index(font, codepoint) else {
+            continue;
+        };
+
+        if codepoint == '\n' {
+            text_offset_y += font_size + line_spacing;
+            text_offset_x = 0.0;
+        } else {
+            if codepoint != ' ' && codepoint != '\t' {
+                unsafe {
+                    draw_text_codepoint(
+                        font.font,
+                        index,
+                        [
+                            position[0] + text_offset_x,
+                            position[1] + text_offset_y,
+                        ],
+                        font_size,
+                        tint,
+                    );
+                }
+            }
+
+            let glyph = unsafe { font.font.glyphs.add(index).read() };
+            let rec = unsafe { font.font.recs.add(index).read() };
+
+            if glyph.advance_x == 0 {
+                text_offset_x += rec.width * scale_factor + spacing;
+            } else {
+                text_offset_x +=
+                    glyph.advance_x as f32 * scale_factor + spacing;
+            }
+        }
+    }
+}
+
+pub unsafe fn draw_text_codepoint(
+    font: Font,
+    codepoint_index: usize,
+    position: [f32; 2],
+    font_size: f32,
+    tint: RaylibColor,
+) {
+    let index = codepoint_index;
+    let scale_factor = font_size / font.base_size as f32;
+
+    let glyph = unsafe { font.glyphs.add(index).read() };
+    let rec = unsafe { font.recs.add(index).read() };
+    let padding = font.glyph_padding as f32;
+
+    let dst_rec = RaylibRectangle {
+        x: position[0] + glyph.offset_x as f32 * scale_factor
+            - padding * scale_factor,
+        y: position[1] + glyph.offset_y as f32 * scale_factor
+            - padding * scale_factor,
+        width: (rec.width + 2.0 * padding) * scale_factor,
+        height: (rec.height + 2.0 * padding) * scale_factor,
+    };
+
+    let src_rec = RaylibRectangle {
+        x: rec.x - padding,
+        y: rec.y - padding,
+        width: rec.width + 2.0 * padding,
+        height: rec.height + 2.0 * padding,
+    };
+
+    unsafe {
+        draw_texture_pro(font.texture, src_rec, dst_rec, [0.0, 0.0], 0.0, tint);
+    }
+}
+
 #[repr(C)]
-struct RaylibColor {
-    r: u8,
-    g: u8,
-    b: u8,
-    a: u8,
+#[derive(Clone, Copy)]
+pub struct RaylibColor {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub a: u8,
 }
 
 #[repr(C)]
@@ -245,14 +344,14 @@ pub struct Font {
     pub base_size: i32,
     pub glyph_count: i32,
     pub glyph_padding: i32,
-    pub texture: Texture,
+    pub texture: RaylibTexture,
     pub recs: *mut RaylibRectangle,
     pub glyphs: *mut RaylibGlyphInfo,
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-pub struct Texture {
+pub struct RaylibTexture {
     pub id: u32,
     pub width: i32,
     pub height: i32,
@@ -266,8 +365,8 @@ struct RaylibBackend;
 
 impl BackendBase for RaylibBackend {
     fn get_font_base_size(&mut self, font: arna::imui::FontId) -> f32 {
-        let font = font.0.as_ptr().cast::<Font>();
-        unsafe { (*font).base_size as f32 }
+        let font = unsafe { &*font.0.as_ptr().cast::<IndexedFont>() };
+        font.font.base_size as f32
     }
 
     fn get_glypy_data(
@@ -275,19 +374,15 @@ impl BackendBase for RaylibBackend {
         font: arna::imui::FontId,
         ch: char,
     ) -> Option<arna::imui::Glyph> {
-        let font = unsafe { font.0.as_ptr().cast::<Font>().read() };
-        let idx = unsafe { get_glyph_index(font, ch) };
-        if idx < 0 || idx >= font.glyph_count {
-            None
-        } else {
-            let data = unsafe { font.glyphs.add(idx as usize).read() };
-            let rec = unsafe { font.recs.add(idx as usize).read() };
-            Some(Glyph {
-                offset_x: data.offset_x as f32,
-                advance_x: data.advance_x as f32,
-                width: rec.width,
-            })
-        }
+        let font = unsafe { &*font.0.as_ptr().cast::<IndexedFont>() };
+        let idx = get_glyph_index(font, ch)?;
+        let data = unsafe { font.font.glyphs.add(idx as usize).read() };
+        let rec = unsafe { font.font.recs.add(idx as usize).read() };
+        Some(Glyph {
+            offset_x: data.offset_x as f32,
+            advance_x: data.advance_x as f32,
+            width: rec.width,
+        })
     }
 }
 
@@ -303,6 +398,7 @@ extern "C" fn run(app: &mut App) {
                 .font_size(10.)
                 .font_spacing(1.)
                 .fg_color(BLUE)
+                .font_line_spacing(2.)
         });
 
         let _el = ctx.el(0).style(|i, s| {
@@ -443,36 +539,37 @@ extern "C" fn run(app: &mut App) {
                 y,
                 size,
                 spacing,
+                line_spacing,
                 content,
                 font,
                 color,
             }) => unsafe {
                 draw_text_ex(
-                    font.0.as_ptr().cast::<Font>().read(),
-                    CString::new(&*app.ctx.text(content)).unwrap().as_ptr(),
+                    &*font.0.as_ptr().cast::<IndexedFont>(),
+                    &*app.ctx.text(content),
                     [x, y],
                     size,
                     spacing,
-                    RaylibColor {
-                        r: (color >> 24) as u8,
-                        g: (color >> 16) as u8,
-                        b: (color >> 8) as u8,
-                        a: (color >> 0) as u8,
-                    },
+                    line_spacing,
+                    conv_color(color),
                 );
             },
             DrawCmdData::Rect(RectCmdData { x, y, width, height, color }) => unsafe {
                 draw_rectangle(
                     RaylibRectangle { x, y, width, height },
-                    RaylibColor {
-                        r: (color >> 24) as u8,
-                        g: (color >> 16) as u8,
-                        b: (color >> 8) as u8,
-                        a: (color >> 0) as u8,
-                    },
+                    conv_color(color),
                 );
             },
             DrawCmdData::Null => {}
+        }
+    }
+
+    fn conv_color(color: Color) -> RaylibColor {
+        RaylibColor {
+            r: (color >> 24) as u8,
+            g: (color >> 16) as u8,
+            b: (color >> 8) as u8,
+            a: (color >> 0) as u8,
         }
     }
 }
@@ -488,7 +585,12 @@ pub fn main() {
         )
     }));
 
-    let font = unsafe { get_font_default() };
+    let mut font =
+        IndexedFont { font: unsafe { get_font_default() }, index: vec![] };
+
+    for i in 0..font.font.glyph_count as usize {
+        font.index.push(char_hash(unsafe { (*font.font.glyphs.add(i)).value }));
+    }
 
     let mut app = App {
         ctx: Ctx::default(),
@@ -504,8 +606,12 @@ pub fn main() {
             clear_background(RaylibColor { r: 30, g: 35, b: 45, a: 255 })
         };
 
-        module.reload();
-        unsafe { module.run(&mut app) };
+        if cfg!(debug_assertions) {
+            module.reload();
+            unsafe { module.run(&mut app) };
+        } else {
+            run(&mut app);
+        }
 
         unsafe { end_drawing() };
     }

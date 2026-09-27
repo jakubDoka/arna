@@ -47,6 +47,7 @@ impl DynamicLibrary {
     }
 }
 
+#[cfg(not(miri))]
 #[cfg(all(test, not(target_os = "ios")))]
 mod test {
     use {
