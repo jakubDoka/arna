@@ -433,7 +433,7 @@ extern "C" fn run(app: &mut App) {
     let cmds = Arna::scratch(0);
 
     for cmd in app.ctx.cmds(
-        BackendFromBase::new(&mut app.backend),
+        &mut app.backend,
         &cmds,
         InputState { mouse_pos: unsafe { get_mouse_position() } },
     ) {

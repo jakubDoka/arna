@@ -42,7 +42,7 @@ use core::{
 
 #[cfg(feature = "std")]
 pub mod dynlib;
-#[cfg(feature = "std")]
+#[cfg(feature = "alloc")]
 pub mod imui;
 
 #[macro_export]

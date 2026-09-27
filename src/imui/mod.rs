@@ -1,6 +1,6 @@
 use {
     crate::Checkpoint,
-    alloc::vec::Vec,
+    alloc::{string::String, vec::Vec},
     core::{
         cell::{Cell, Ref, RefCell, RefMut},
         fmt::Write,
@@ -18,7 +18,7 @@ pub struct DrawCmd {
     pub data: DrawCmdData,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct RectCmdData {
     pub x: f32,
     pub y: f32,
@@ -27,7 +27,7 @@ pub struct RectCmdData {
     pub color: Color,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct TextCmdData {
     pub x: f32,
     pub y: f32,
@@ -38,7 +38,7 @@ pub struct TextCmdData {
     pub color: Color,
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone, Copy)]
 pub enum DrawCmdData {
     #[default]
     Null,
@@ -46,7 +46,7 @@ pub enum DrawCmdData {
     Text(TextCmdData),
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct TextBuf {
     buf: String,
 }
@@ -113,10 +113,12 @@ impl TextId {
     }
 }
 
+#[derive(Default, Debug, Clone, Copy)]
 pub struct InputState {
     pub mouse_pos: [f32; DIMS],
 }
 
+#[derive(Default, Debug, Clone, Copy)]
 pub struct Glyph {
     pub offset_x: f32,
     pub advance_x: f32,
@@ -239,7 +241,7 @@ impl<B: BackendBase> Backend for BackendFromBase<B> {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct Ctx {
     frames: [RefCell<FrameCtx>; DIMS],
     parent: Cell<ElemIdx>,
@@ -284,10 +286,27 @@ impl Ctx {
         StyleScope { ctx: self, prev }
     }
 
+    #[cfg(feature = "std")]
     pub fn cmds<'a, 'b>(
+        &mut self,
+        backend: &mut impl BackendBase,
+        scratch: &'a Checkpoint<'b>,
+        input_state: InputState,
+    ) -> Vec<DrawCmd, &'a Checkpoint<'b>> {
+        let arna = crate::Arna::scratch(scratch);
+        self.cmds_ext(
+            BackendFromBase::new(backend),
+            scratch,
+            &arna,
+            input_state,
+        )
+    }
+
+    pub fn cmds_ext<'a, 'b>(
         &mut self,
         backend: &mut dyn Backend,
         scratch: &'a Checkpoint<'b>,
+        arna: &Checkpoint,
         input_state: InputState,
     ) -> Vec<DrawCmd, &'a Checkpoint<'b>> {
         #[derive(Clone, Copy, PartialEq, Eq)]
@@ -346,8 +365,6 @@ impl Ctx {
                 unsafe { transmute(value) }
             }
         }
-
-        let arna = crate::Arna::scratch(scratch);
 
         self.current_elem.take();
         self.parent.take();
@@ -763,6 +780,7 @@ impl Drop for StyleScope<'_> {
     }
 }
 
+#[derive(Debug)]
 pub struct FrameCtx {
     elemets: Vec<Elem>,
     text: TextBuf,
@@ -770,7 +788,10 @@ pub struct FrameCtx {
 
 impl Default for FrameCtx {
     fn default() -> Self {
-        Self { elemets: vec![Default::default()], text: Default::default() }
+        Self {
+            elemets: alloc::vec![Default::default()],
+            text: Default::default(),
+        }
     }
 }
 
@@ -911,7 +932,7 @@ impl Drop for ElemBuilder<'_> {
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug)]
 pub struct Elem {
     pub id: ElemID,
     parent: ElemIdx,
@@ -970,7 +991,7 @@ pub const fn perc(vl: f32) -> f32 {
     -vl
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug)]
 struct LayoutDim {
     pos: f32,
     size: f32,
@@ -987,7 +1008,7 @@ impl ElemIdx {
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug)]
 pub enum Align {
     #[default]
     Start,
@@ -1043,7 +1064,7 @@ macro_rules! derive_style_builder {
 }
 
 derive_style_builder! {
-    #[derive(Clone, Copy, Default)]
+    #[derive(Clone, Copy, Default, Debug)]
     pub struct Style {
         pub dims: [StyleDim; DIMS],
         pub bg_color: Color,
@@ -1141,7 +1162,7 @@ impl Style {
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug)]
 pub struct StyleDim {
     pub align: Align,
     pub size: f32,
@@ -1193,13 +1214,13 @@ pub const fn mix_u32(a: u32, b: u32) -> u32 {
     h
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug)]
 pub enum Layout {
     #[default]
     Flex,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug)]
 pub enum Direction {
     #[default]
     Left2Right,
