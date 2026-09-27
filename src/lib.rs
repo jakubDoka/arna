@@ -1,20 +1,56 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
-#[cfg(feature = "std")]
-use core::cell::UnsafeCell;
 use core::{
-    alloc::Layout,
+    alloc::{AllocError, Allocator, Layout},
     cell::Cell,
     marker::{PhantomData, PhantomPinned},
     mem::{MaybeUninit, transmute},
     ops::{Deref, DerefMut},
     pin::Pin,
-    ptr::{NonNull, copy_nonoverlapping, drop_in_place, null},
+    ptr::{
+        NonNull, copy_nonoverlapping, drop_in_place, null,
+        slice_from_raw_parts_mut,
+    },
+    slice,
 };
 
-use core::ptr::slice_from_raw_parts_mut;
+//pub fn lex(root) {
+//    let modules = Mods::new(); // locked
+//    let queu = Queue::new();
+//    queu.push(Task::new(root));
+//    let queue_ref = threads::broadcast(&queu):
+//    let mods_ref = threads::broadcast(&modules);
+//
+//    while let Some(task) = queue_ref.next() {
+//        {
+//            let lexed = lex_file(task);
+//            for import in &mut lexed {
+//                let (link, is_new) = mods_ref.get_or_insert_module(task.from, import.path)
+//                    .unwrap().link();
+//                import.link = link;
+//                if is_new {
+//                    queue_ref.push(Task::new(link));
+//                }
+//            }
+//        }
+//
+//        task.mark_done();
+//    }
+//
+//    thread::barier();
+//}
 
-use core::slice;
+#[cfg(feature = "std")]
+pub mod dynlib;
+#[cfg(feature = "std")]
+pub mod imui;
+
+#[macro_export]
+macro_rules! aformat {
+    ($a:expr, $($tt:tt)*) => {
+        $a.format(format_args!($($tt)*))
+    };
+}
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
@@ -36,6 +72,14 @@ impl<'a> Checkpoint<'a> {
 
     /// # SAFETY
     ///
+    /// Only safe if all allocated references are unreachable.
+    pub unsafe fn reset(&self) {
+        let arna = unsafe { self.get_inner() };
+        arna.pos.set(self.prev_pos);
+    }
+
+    /// # SAFETY
+    ///
     /// Not safe to keep this ref around while allocating from other checkpoints as the depht
     /// check is performed here, so on your own risk, but it does allow you to avoid the
     /// repeated checks
@@ -43,6 +87,53 @@ impl<'a> Checkpoint<'a> {
         let arna = unsafe { self.arna.as_ref() };
         assert_eq!(self.depth, arna.depth.get());
         arna
+    }
+
+    pub unsafe fn can_deallocate(
+        &self,
+        ptr: NonNull<u8>,
+        layout: Layout,
+    ) -> bool {
+        let s = unsafe { self.get_inner() };
+        unsafe { s.ptr.add(s.pos.get()).sub(layout.size()) == ptr.as_ptr() }
+    }
+
+    pub fn format<'b>(&'b self, args: core::fmt::Arguments) -> &'b mut str {
+        use core::fmt::Write;
+
+        struct Writer<'a, 'b> {
+            check: &'b Checkpoint<'a>,
+        }
+
+        impl core::fmt::Write for Writer<'_, '_> {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                let slot = self
+                    .check
+                    .try_alloc_uninit::<u8>(s.len())
+                    .map_err(|_| core::fmt::Error)?;
+                unsafe {
+                    copy_nonoverlapping(
+                        s as *const _ as *const u8,
+                        slot as *mut _ as *mut _,
+                        s.len(),
+                    );
+                }
+                Ok(())
+            }
+        }
+
+        let start = unsafe { self.get_inner() }.pos.get();
+
+        let mut wrt = Writer { check: self };
+        wrt.write_fmt(args).expect("OOM");
+
+        let data = unsafe { self.get_inner().ptr.add(start) };
+        let len = unsafe { self.get_inner() }.pos.get() - start;
+        unsafe {
+            core::str::from_utf8_unchecked_mut(core::slice::from_raw_parts_mut(
+                data, len,
+            ))
+        }
     }
 
     pub fn create<T>(&self, value: T) -> &mut T {
@@ -55,7 +146,13 @@ impl<'a> Checkpoint<'a> {
 
     pub fn alloc<T>(&self, value: &[T]) -> &mut [T] {
         let alloc = self.alloc_uninit(value.len());
-        unsafe { copy_nonoverlapping(value.as_ptr(), alloc.as_mut_ptr() as _, value.len()) };
+        unsafe {
+            copy_nonoverlapping(
+                value.as_ptr(),
+                alloc.as_mut_ptr() as _,
+                value.len(),
+            )
+        };
         unsafe { alloc.assume_init_mut() }
     }
 
@@ -66,10 +163,16 @@ impl<'a> Checkpoint<'a> {
     }
 
     pub fn alloc_uninit<T>(&self, len: usize) -> &mut [MaybeUninit<T>] {
+        self.try_alloc_uninit(len).expect("OOM")
+    }
+
+    pub fn try_alloc_uninit<T>(
+        &self,
+        len: usize,
+    ) -> Result<&mut [MaybeUninit<T>], AllocError> {
         let ptr = unsafe { self.get_inner() }
-            .alloc_raw(Layout::array::<T>(len).expect("bad layout"))
-            .expect("OOM");
-        unsafe { slice::from_raw_parts_mut(ptr.as_ptr() as _, len) }
+            .alloc_raw(Layout::array::<T>(len).expect("bad layout"))?;
+        Ok(unsafe { slice::from_raw_parts_mut(ptr.as_ptr() as _, len) })
     }
 }
 
@@ -150,8 +253,12 @@ pub struct Arna<'a> {
 }
 
 #[cfg(feature = "std")]
+pub type TempArenas =
+    std::thread::LocalKey<core::cell::UnsafeCell<[Arna<'static>; 2]>>;
+
+#[cfg(feature = "std")]
 thread_local! {
-    static TEMP_ARENAS: UnsafeCell<[Arna<'static>; 2]> = Default::default();
+    pub static TEMP_ARENAS: core::cell::UnsafeCell<[Arna<'static>; 2]> = Default::default();
 }
 
 impl<'a> Arna<'a> {
@@ -164,6 +271,50 @@ impl<'a> Arna<'a> {
         unsafe { transmute(vl) }
     }
 
+    #[cfg(feature = "std")]
+    pub fn scratch(clobber: impl IntoClobber) -> Checkpoint<'static> {
+        cfg_select! {
+            feature = "dll" => {
+                let ptr = ARNA_TEMP_ARENAS_OVERRIDE
+                    .load(core::sync::atomic::Ordering::Relaxed);
+
+                // SAFETY: the person initializing the DLL_TEMP_ARENAS passed a valid
+                // pointer
+                let temp = match unsafe { ptr.as_ref() } {
+                    Some(v) => v,
+                    None => &TEMP_ARENAS,
+                };
+
+                Self::scratch_with(clobber, temp)
+            }
+            _ => Self::scratch_with(clobber, &TEMP_ARENAS),
+        }
+    }
+
+    #[cfg(feature = "std")]
+    pub fn scratch_with(
+        clobber: impl IntoClobber,
+        temp: &'static TempArenas,
+    ) -> Checkpoint<'static> {
+        let clobber = clobber.address();
+        temp.with(|arenas| {
+            let refr = unsafe { &*arenas.get() };
+            for vl in refr {
+                if vl as *const _ as *const _ != clobber {
+                    return unsafe { Pin::new_unchecked(vl).checkpoint_ref() };
+                }
+            }
+            unreachable!()
+        })
+    }
+
+    #[cfg(feature = "std")]
+    pub fn init_temp_arenas(slots: [Arna<'static>; 2]) {
+        // SAFETY: the drop of the previous arenas will panic if any checkpoints are still
+        // active
+        TEMP_ARENAS.with(|old_slots| unsafe { *old_slots.get() = slots })
+    }
+
     #[cfg(feature = "virtual")]
     pub fn clear_and_decommit(&mut self) {
         // SAFETY: the checkpoints can only be created from the pinned arena, that means we
@@ -172,8 +323,11 @@ impl<'a> Arna<'a> {
         unsafe {
             use core::slice::from_raw_parts_mut;
 
-            virtual_mem::decommit(from_raw_parts_mut(self.ptr, self.commited.get()))
-                .expect("this should not fail considering the invariants")
+            virtual_mem::decommit(from_raw_parts_mut(
+                self.ptr,
+                self.commited.get(),
+            ))
+            .expect("this should not fail considering the invariants")
         };
         self.commited.set(0);
         self.pos.set(0);
@@ -192,11 +346,19 @@ impl<'a> Arna<'a> {
         }
     }
 
-    pub fn alloc_raw(&self, layout: Layout) -> Result<NonNull<u8>, OOM> {
+    pub fn alloc_raw(
+        &self,
+        layout: Layout,
+    ) -> Result<NonNull<[u8]>, AllocError> {
         let curr = unsafe { self.ptr.add(self.pos.get()) };
         let off = curr.align_offset(layout.align());
 
         let base = unsafe { curr.add(off) };
+
+        if self.pos.get() + layout.size() > self.cap {
+            return Err(AllocError);
+        }
+
         self.pos.update(|p| p + off + layout.size());
 
         #[cfg(feature = "virtual")]
@@ -204,11 +366,11 @@ impl<'a> Arna<'a> {
             let to_reserve = (self.commited.get() + Arna::COMMIT_CHUNK)
                 .max(self.pos.get())
                 .min(self.cap);
-            let to_reserve = (to_reserve + Arna::PAGE_SIZE - 1) & !(Arna::PAGE_SIZE - 1);
+            let to_reserve =
+                (to_reserve + Arna::PAGE_SIZE - 1) & !(Arna::PAGE_SIZE - 1);
             assert!(to_reserve != 0);
             unsafe {
-                use core::slice::from_raw_parts_mut;
-                virtual_mem::commit(from_raw_parts_mut(
+                virtual_mem::commit(slice_from_raw_parts_mut(
                     self.ptr.add(self.commited.get()),
                     to_reserve - self.commited.get(),
                 ))?
@@ -216,22 +378,10 @@ impl<'a> Arna<'a> {
             self.commited.set(to_reserve);
         }
 
-        if self.pos.get() > self.cap {
-            self.pos.set(self.cap);
-            Err(OOM)
-        } else {
-            Ok(unsafe { NonNull::new_unchecked(base) })
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct OOM;
-
-#[cfg(feature = "virtual")]
-impl From<virtual_mem::Error> for OOM {
-    fn from(_: virtual_mem::Error) -> Self {
-        OOM
+        Ok(unsafe {
+            let slc = slice_from_raw_parts_mut(base, layout.size());
+            NonNull::new_unchecked(slc)
+        })
     }
 }
 
@@ -251,35 +401,22 @@ impl IntoClobber for &'_ Checkpoint<'_> {
     }
 }
 
+#[cfg(feature = "dll")]
+#[unsafe(no_mangle)]
+pub static ARNA_TEMP_ARENAS_OVERRIDE: core::sync::atomic::AtomicPtr<
+    TempArenas,
+> = core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
 #[cfg(feature = "virtual")]
 impl Arna<'static> {
     const COMMIT_CHUNK: usize = 1024 * 1024;
     // NOTE: shoud cover all platforms, eventhough overdoing it on some
     const PAGE_SIZE: usize = 1 << 16;
 
-    pub fn scratch<'a>(clobber: impl IntoClobber) -> Checkpoint<'static> {
-        let clobber = clobber.address();
-        TEMP_ARENAS.with(|arenas| {
-            let refr = unsafe { &*arenas.get() };
-            for vl in refr {
-                if vl as *const _ as *const _ != clobber {
-                    return unsafe { Pin::new_unchecked(vl).checkpoint_ref() };
-                }
-            }
-            unreachable!()
-        })
-    }
-
     pub fn new_virtual(cap: usize) -> Result<Self, virtual_mem::Error> {
         assert!(cap % Self::PAGE_SIZE == 0);
         let mem = virtual_mem::reserve(cap)?;
         Ok(unsafe { Arna::new(mem as _, BackingMode::Virtual) })
-    }
-
-    pub fn init_temp_arenas(slots: [Arna<'static>; 2]) {
-        // SAFETY: the drop of the previous arenas will panic if any checkpoints are still
-        // active
-        TEMP_ARENAS.with(|old_slots| unsafe { *old_slots.get() = slots })
     }
 
     pub fn init_bulk<const COUNT: usize>(
@@ -294,9 +431,9 @@ impl Arna<'static> {
                 // Windows sucks in this regard, it does not let us free arbitrary ranges of
                 // the allocation
                 for (arna, cap) in arnas.iter_mut().zip(caps) {
-                    arna.write(unsafe { Arna::new_virtual(cap)? });
+                    arna.write(Arna::new_virtual(cap)?);
                 }
-            },
+            }
             _ => {
                 let total_cap = caps.iter().sum::<usize>();
                 let mut mem = virtual_mem::reserve(total_cap)?;
@@ -311,9 +448,14 @@ impl Arna<'static> {
                         )
                     });
 
-                    mem = unsafe { slice_from_raw_parts_mut((mem as *mut u8).add(cap), mem.len() - cap) };
+                    mem = unsafe {
+                        slice_from_raw_parts_mut(
+                            (mem as *mut u8).add(cap),
+                            mem.len() - cap,
+                        )
+                    };
                 }
-            },
+            }
         }
 
         Ok(unsafe { arnas.map(|v| v.assume_init()) })
@@ -328,7 +470,7 @@ impl<'a> From<&'a mut [u8]> for Arna<'a> {
 
 impl<'a> From<&'a mut [MaybeUninit<u8>]> for Arna<'a> {
     fn from(value: &'a mut [MaybeUninit<u8>]) -> Self {
-        unsafe { Arna::new(value, BackingMode::Box) }
+        unsafe { Arna::new(value, BackingMode::Slice) }
     }
 }
 
@@ -346,6 +488,7 @@ impl Arna<'static> {
             ptr: mem as _,
             cap: mem.len(),
             commited: Cell::new(match mode {
+                #[cfg(feature = "virtual")]
                 BackingMode::Virtual => 0,
                 _ => mem.len() + mode as usize,
             }),
@@ -374,16 +517,103 @@ impl Drop for Arna<'_> {
             },
             BackingMode::Slice => {}
             #[cfg(feature = "alloc")]
-            BackingMode::Box => unsafe { drop(alloc::boxed::Box::from_raw(_mem)) },
+            BackingMode::Box => unsafe {
+                drop(alloc::boxed::Box::from_raw(_mem))
+            },
         }
+    }
+}
+
+unsafe impl<'a> Allocator for Checkpoint<'a> {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        unsafe { self.get_inner() }.alloc_raw(layout).map_err(|_| AllocError)
+    }
+
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        if unsafe { self.can_deallocate(ptr, layout) } {
+            unsafe { self.get_inner() }.pos.update(|p| p - layout.size());
+        }
+    }
+
+    unsafe fn grow(
+        &self,
+        ptr: NonNull<u8>,
+        old_layout: Layout,
+        new_layout: Layout,
+    ) -> Result<NonNull<[u8]>, core::alloc::AllocError> {
+        debug_assert!(
+            new_layout.size() >= old_layout.size(),
+            "`new_layout.size()` must be greater than or equal to `old_layout.size()`"
+        );
+
+        let can_reuse = unsafe { self.can_deallocate(ptr, old_layout) };
+        let can_reuse = can_reuse && new_layout.align() == old_layout.align();
+        let s = unsafe { self.get_inner() };
+
+        if can_reuse {
+            s.pos.update(|p| p - old_layout.size());
+        }
+
+        let new = s.alloc_raw(new_layout)?;
+
+        if !can_reuse {
+            unsafe {
+                copy_nonoverlapping(
+                    ptr.as_ptr(),
+                    new.as_ptr() as *mut _,
+                    old_layout.size(),
+                );
+            }
+        }
+
+        Ok(new)
+    }
+
+    unsafe fn grow_zeroed(
+        &self,
+        ptr: NonNull<u8>,
+        old_layout: Layout,
+        new_layout: Layout,
+    ) -> Result<NonNull<[u8]>, core::alloc::AllocError> {
+        debug_assert!(
+            new_layout.size() >= old_layout.size(),
+            "`new_layout.size()` must be greater than or equal to `old_layout.size()`"
+        );
+
+        let new = unsafe { self.grow(ptr, old_layout, new_layout) }?;
+        unsafe {
+            (new.as_ptr() as *mut u8)
+                .add(old_layout.size())
+                .write_bytes(0, new_layout.size() - old_layout.size())
+        }
+        Ok(new)
+    }
+
+    unsafe fn shrink(
+        &self,
+        ptr: NonNull<u8>,
+        old_layout: Layout,
+        new_layout: Layout,
+    ) -> Result<NonNull<[u8]>, core::alloc::AllocError> {
+        debug_assert!(
+            new_layout.size() <= old_layout.size(),
+            "`new_layout.size()` must be smaller than or equal to `old_layout.size()`"
+        );
+
+        if unsafe { self.can_deallocate(ptr, old_layout) } {
+            unsafe { self.get_inner() }
+                .pos
+                .update(|p| p - (old_layout.size() - new_layout.size()));
+        }
+
+        let slc = slice_from_raw_parts_mut(ptr.as_ptr(), new_layout.size());
+        Ok(unsafe { NonNull::new_unchecked(slc) })
     }
 }
 
 #[cfg(test)]
 pub mod tests {
-    use core::pin::pin;
-
-    use crate::Arna;
+    use {crate::Arna, core::pin::pin};
 
     #[cfg(feature = "alloc")]
     #[test]
@@ -407,6 +637,9 @@ pub mod tests {
 
             let mem = check_2.alloc(mem);
             mem.fill(10);
+
+            assert_eq!(aformat!(check_2, "foob {}", 10), "foob 10");
+
             mem
         };
 
@@ -450,7 +683,9 @@ pub mod tests {
 
     #[test]
     fn virtual_meme() {
-        Arna::init_temp_arenas(Arna::init_bulk([1024 * 1024 * 8; 2]).expect("brahm"));
+        Arna::init_temp_arenas(
+            Arna::init_bulk([1024 * 1024 * 8; 2]).expect("brahm"),
+        );
 
         let check = Arna::scratch(0);
 
@@ -465,10 +700,16 @@ pub mod tests {
 
 #[cfg(feature = "virtual")]
 pub mod virtual_mem {
-    use core::ptr::slice_from_raw_parts_mut;
+    use core::{alloc::AllocError, ptr::slice_from_raw_parts_mut};
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub struct Error(i32);
+
+    impl From<Error> for AllocError {
+        fn from(_: Error) -> Self {
+            AllocError
+        }
+    }
 
     impl Error {
         pub const fn raw_os_error(self) -> i32 {
@@ -528,8 +769,10 @@ pub mod virtual_mem {
 
     #[cfg(target_os = "linux")]
     mod sys {
-        use super::Error;
-        use core::ffi::{c_int, c_long};
+        use {
+            super::Error,
+            core::ffi::{c_int, c_long},
+        };
 
         const PROT_NONE: usize = 0;
         const PROT_READ_WRITE: usize = 1 | 2;
@@ -593,25 +836,36 @@ pub mod virtual_mem {
             }
         }
 
-        pub(super) unsafe fn commit(ptr: *mut u8, len: usize) -> Result<(), Error> {
-            syscall_result(unsafe { syscall(SYS_MPROTECT, ptr as usize, len, PROT_READ_WRITE) })
+        pub(super) unsafe fn commit(
+            ptr: *mut u8,
+            len: usize,
+        ) -> Result<(), Error> {
+            syscall_result(unsafe {
+                syscall(SYS_MPROTECT, ptr as usize, len, PROT_READ_WRITE)
+            })
         }
 
-        pub(super) unsafe fn decommit(ptr: *mut u8, len: usize) -> Result<(), Error> {
-            syscall_result(unsafe { syscall(SYS_MPROTECT, ptr as usize, len, PROT_NONE) })?;
-            syscall_result(unsafe { syscall(SYS_MADVISE, ptr as usize, len, MADV_DONTNEED) })
+        pub(super) unsafe fn decommit(
+            ptr: *mut u8,
+            len: usize,
+        ) -> Result<(), Error> {
+            syscall_result(unsafe {
+                syscall(SYS_MPROTECT, ptr as usize, len, PROT_NONE)
+            })?;
+            syscall_result(unsafe {
+                syscall(SYS_MADVISE, ptr as usize, len, MADV_DONTNEED)
+            })
         }
 
-        pub(super) unsafe fn release(ptr: *mut u8, len: usize) -> Result<(), Error> {
+        pub(super) unsafe fn release(
+            ptr: *mut u8,
+            len: usize,
+        ) -> Result<(), Error> {
             syscall_result(unsafe { syscall(SYS_MUNMAP, ptr as usize, len) })
         }
 
         fn syscall_result(result: c_long) -> Result<(), Error> {
-            if result == -1 {
-                Err(last_error())
-            } else {
-                Ok(())
-            }
+            if result == -1 { Err(last_error()) } else { Ok(()) }
         }
 
         fn last_error() -> Error {
@@ -621,8 +875,7 @@ pub mod virtual_mem {
 
     #[cfg(target_os = "windows")]
     mod sys {
-        use super::Error;
-        use core::ffi::c_void;
+        use {super::Error, core::ffi::c_void};
 
         const MEM_COMMIT: u32 = 0x1000;
         const MEM_RESERVE: u32 = 0x2000;
@@ -639,7 +892,11 @@ pub mod virtual_mem {
                 allocation_type: u32,
                 protect: u32,
             ) -> *mut c_void;
-            fn VirtualFree(address: *mut c_void, size: usize, free_type: u32) -> i32;
+            fn VirtualFree(
+                address: *mut c_void,
+                size: usize,
+                free_type: u32,
+            ) -> i32;
             fn GetLastError() -> u32;
         }
 
@@ -648,33 +905,46 @@ pub mod virtual_mem {
         }
 
         pub(super) fn reserve(size: usize) -> Result<*mut u8, Error> {
-            let ptr =
-                unsafe { VirtualAlloc(core::ptr::null_mut(), size, MEM_RESERVE, PAGE_NOACCESS) };
-            if ptr.is_null() {
-                Err(last_error())
-            } else {
-                Ok(ptr.cast())
-            }
+            let ptr = unsafe {
+                VirtualAlloc(
+                    core::ptr::null_mut(),
+                    size,
+                    MEM_RESERVE,
+                    PAGE_NOACCESS,
+                )
+            };
+            if ptr.is_null() { Err(last_error()) } else { Ok(ptr.cast()) }
         }
 
-        pub(super) unsafe fn commit(ptr: *mut u8, len: usize) -> Result<(), Error> {
-            let result = unsafe { VirtualAlloc(ptr.cast(), len, MEM_COMMIT, PAGE_READWRITE) };
-            if result.is_null() {
-                Err(last_error())
-            } else {
-                Ok(())
-            }
+        pub(super) unsafe fn commit(
+            ptr: *mut u8,
+            len: usize,
+        ) -> Result<(), Error> {
+            let result = unsafe {
+                VirtualAlloc(ptr.cast(), len, MEM_COMMIT, PAGE_READWRITE)
+            };
+            if result.is_null() { Err(last_error()) } else { Ok(()) }
         }
 
-        pub(super) unsafe fn decommit(ptr: *mut u8, len: usize) -> Result<(), Error> {
+        pub(super) unsafe fn decommit(
+            ptr: *mut u8,
+            len: usize,
+        ) -> Result<(), Error> {
             unsafe { virtual_free(ptr, len, MEM_DECOMMIT) }
         }
 
-        pub(super) unsafe fn release(ptr: *mut u8, _len: usize) -> Result<(), Error> {
+        pub(super) unsafe fn release(
+            ptr: *mut u8,
+            _len: usize,
+        ) -> Result<(), Error> {
             unsafe { virtual_free(ptr, 0, MEM_RELEASE) }
         }
 
-        unsafe fn virtual_free(ptr: *mut u8, len: usize, free_type: u32) -> Result<(), Error> {
+        unsafe fn virtual_free(
+            ptr: *mut u8,
+            len: usize,
+            free_type: u32,
+        ) -> Result<(), Error> {
             if unsafe { VirtualFree(ptr.cast(), len, free_type) } == 0 {
                 Err(last_error())
             } else {
@@ -689,8 +959,10 @@ pub mod virtual_mem {
 
     #[cfg(target_os = "macos")]
     mod sys {
-        use super::Error;
-        use core::ffi::{c_int, c_void};
+        use {
+            super::Error,
+            core::ffi::{c_int, c_void},
+        };
 
         const PROT_NONE: c_int = 0;
         const PROT_READ_WRITE: c_int = 1 | 2;
@@ -706,8 +978,16 @@ pub mod virtual_mem {
                 fd: c_int,
                 offset: i64,
             ) -> *mut c_void;
-            fn mprotect(address: *mut c_void, len: usize, protection: c_int) -> c_int;
-            fn madvise(address: *mut c_void, len: usize, advice: c_int) -> c_int;
+            fn mprotect(
+                address: *mut c_void,
+                len: usize,
+                protection: c_int,
+            ) -> c_int;
+            fn madvise(
+                address: *mut c_void,
+                len: usize,
+                advice: c_int,
+            ) -> c_int;
             fn munmap(address: *mut c_void, len: usize) -> c_int;
             fn __error() -> *mut c_int;
         }
@@ -727,32 +1007,33 @@ pub mod virtual_mem {
                     0,
                 )
             };
-            if ptr as isize == -1 {
-                Err(last_error())
-            } else {
-                Ok(ptr.cast())
-            }
+            if ptr as isize == -1 { Err(last_error()) } else { Ok(ptr.cast()) }
         }
 
-        pub(super) unsafe fn commit(ptr: *mut u8, len: usize) -> Result<(), Error> {
+        pub(super) unsafe fn commit(
+            ptr: *mut u8,
+            len: usize,
+        ) -> Result<(), Error> {
             result(unsafe { mprotect(ptr.cast(), len, PROT_READ_WRITE) })
         }
 
-        pub(super) unsafe fn decommit(ptr: *mut u8, len: usize) -> Result<(), Error> {
+        pub(super) unsafe fn decommit(
+            ptr: *mut u8,
+            len: usize,
+        ) -> Result<(), Error> {
             result(unsafe { mprotect(ptr.cast(), len, PROT_NONE) })?;
             result(unsafe { madvise(ptr.cast(), len, MADV_DONTNEED) })
         }
 
-        pub(super) unsafe fn release(ptr: *mut u8, len: usize) -> Result<(), Error> {
+        pub(super) unsafe fn release(
+            ptr: *mut u8,
+            len: usize,
+        ) -> Result<(), Error> {
             result(unsafe { munmap(ptr.cast(), len) })
         }
 
         fn result(result: c_int) -> Result<(), Error> {
-            if result == -1 {
-                Err(last_error())
-            } else {
-                Ok(())
-            }
+            if result == -1 { Err(last_error()) } else { Ok(()) }
         }
 
         fn last_error() -> Error {
@@ -760,8 +1041,14 @@ pub mod virtual_mem {
         }
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-    compile_error!("the virtual feature only supports Linux, Windows, and macOS");
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "windows",
+        target_os = "macos"
+    )))]
+    compile_error!(
+        "the virtual feature only supports Linux, Windows, and macOS"
+    );
 
     #[cfg(test)]
     #[cfg(not(miri))]

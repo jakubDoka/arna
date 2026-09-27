@@ -12,3 +12,15 @@ default = ["alloc", "virtual", "std"]
 std = ["alloc"]
 alloc = []
 virtual = []
+example-link-raylib = []
+dll = []
+
+[[example]]
+name = "raylib-lib"
+crate-type = ["cdylib"]
+required-features = ["example-link-raylib", "dll"]
+
+[[example]]
+name = "raylib"
+path = "examples/raylib.rs"
+required-features = ["example-link-raylib"]

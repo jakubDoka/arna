@@ -1,0 +1,19 @@
+# Requires nightly rustfmt because some options are unstable.
+unstable_features = true
+
+# Compact struct literals where possible.
+struct_lit_single_line = true
+struct_lit_width = 80
+use_small_heuristics = "Max"
+
+# Merge imports into as few `use` statements as possible.
+imports_granularity = "One"
+group_imports = "One"
+
+# Optional: generally favor compact formatting.
+max_width = 80
+fn_call_width = 80
+array_width = 80
+chain_width = 80
+single_line_if_else_max_width = 80
+single_line_let_else_max_width = 80
