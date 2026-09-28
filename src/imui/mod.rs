@@ -433,7 +433,7 @@ impl Ctx {
             let r = &ctx[root];
 
             if max_width == 0. {
-                max_width = r.inner_size(0)
+                max_width = r.inner_size(Dim::X)
             }
 
             if let Some((font, full_text)) = get_text_params(ctx, root) {
@@ -499,14 +499,14 @@ impl Ctx {
 
             extra.text_hash = fnv1a(ctx.text.get(elem.style.text).as_bytes());
 
-            for (dim, edim) in
-                [Dim::X, Dim::Y].into_iter().zip(elem.dims.iter_mut())
-            {
+            for dim in [Dim::X, Dim::Y] {
                 if let Size::Fixed(size) = elem.style.size[dim].to_size() {
-                    edim.size = size;
+                    elem.size[dim] = size;
                 }
-                edim.size = f32::max(edim.size, elem.style.min_size[dim]);
-                edim.size = f32::max(edim.size, elem.style.padding[dim].sum());
+                elem.size[dim] =
+                    f32::max(elem.size[dim], elem.style.min_size[dim]);
+                elem.size[dim] =
+                    f32::max(elem.size[dim], elem.style.padding[dim].sum());
             }
         }
 
@@ -537,8 +537,7 @@ impl Ctx {
                     let mut iter = ctx[root].first_child;
                     let mut gap_x = 0.;
                     while let Some(child) = iter.next(ctx) {
-                        ctx[root].dims[x as usize].size +=
-                            gap_x + ctx[child].outer_size(x);
+                        ctx[root].size[x] += gap_x + ctx[child].outer_size(x);
                         gap_x = ctx[root].style.gap;
                     }
                 }
@@ -549,8 +548,8 @@ impl Ctx {
                     f32::MAX
                 )) {
                     if ctx[root].style.size[d].is_fit() {
-                        ctx[root].dims[d as usize].size = f32::max(
-                            ctx[root].dims[d as usize].size,
+                        ctx[root].size[d] = f32::max(
+                            ctx[root].size[d],
                             s + ctx[root].style.padding[d].sum(),
                         );
                     }
@@ -571,16 +570,15 @@ impl Ctx {
                         if let Size::Perc(p) =
                             ctx[child].style.size[y].to_size()
                         {
-                            ctx[child].dims[y as usize].size = (ctx[root]
-                                .inner_size(y)
+                            ctx[child].size[y] = (ctx[root].inner_size(y)
                                 - ctx[child].style.margin[y].sum())
                                 * p;
 
                             if y == Dim::X {
                                 let [_, h] = measure_text!(ctx, child, 0.);
 
-                                ctx[child].dims[x as usize].size = f32::max(
-                                    ctx[child].dims[x as usize].size,
+                                ctx[child].size[x] = f32::max(
+                                    ctx[child].size[x],
                                     h + ctx[child].style.padding[x].sum(),
                                 );
                             }
@@ -593,10 +591,8 @@ impl Ctx {
                         extra[child].line = line;
 
                         // NOTE: we look ahead so this means we are the first in the row
-                        if free_space < 0.
-                            && !ctx[child].dims[x as usize].size.is_fixed()
-                        {
-                            ctx[child].dims[x as usize].size += free_space;
+                        if free_space < 0. && !ctx[child].size[x].is_fixed() {
+                            ctx[child].size[x] += free_space;
                         }
 
                         let mut process_line = iter.0 == 0;
@@ -633,15 +629,12 @@ impl Ctx {
                                 if let Size::Perc(p) =
                                     ctx[line_child].style.size[x].to_size()
                                 {
-                                    ctx[line_child].dims[x as usize].size =
-                                        f32::max(
-                                            ctx[line_child].dims[x as usize]
-                                                .size,
-                                            free_space * (p / total_perc)
-                                                + ctx[line_child].style.padding
-                                                    [x]
-                                                    .sum(),
-                                        );
+                                    ctx[line_child].size[x] = f32::max(
+                                        ctx[line_child].size[x],
+                                        free_space * (p / total_perc)
+                                            + ctx[line_child].style.padding[x]
+                                                .sum(),
+                                    );
                                 }
                             }
 
@@ -700,7 +693,7 @@ impl Ctx {
                         .zip(measure_text!(ctx, root, 0.))
                     {
                         if ctx[root].style.size[d].is_fit() {
-                            ctx[root].dims[d as usize].size = f32::max(max, td)
+                            ctx[root].size[d] = f32::max(max, td)
                                 + ctx[root].style.padding[d].sum();
                         }
                     }
@@ -717,21 +710,21 @@ impl Ctx {
 
                     let mut iter = ctx[root].first_child;
                     let mut cursor_x = 0.;
-                    let mut cursor_y = ctx[root].dims[y as usize].pos
+                    let mut cursor_y = ctx[root].pos[y]
                         + ctx[root].style.align[y].offset(free_y)
-                        + ctx[root].style.padding[y][0];
+                        + ctx[root].style.padding[y].before;
                     let mut y_size = 0.;
                     let mut last_line = u16::MAX;
                     let mut gap_x = 0.;
                     let mut gap_y = 0.;
                     while let Some(child) = iter.next(ctx) {
                         if extra[child].line != last_line {
-                            cursor_x = ctx[root].dims[x as usize].pos
+                            cursor_x = ctx[root].pos[x]
                                 + ctx[root].style.align[x].offset(
                                     ctx[root].inner_size(x)
                                         - extra[child].used_x,
                                 )
-                                + ctx[root].style.padding[x][0];
+                                + ctx[root].style.padding[x].before;
                             cursor_y += gap_y + y_size;
                             gap_y = ctx[root].style.gap;
                             y_size = 0.;
@@ -749,10 +742,11 @@ impl Ctx {
                             }
                         }
 
-                        ctx[child].dims[x as usize].pos =
-                            gap_x + cursor_x + ctx[child].style.margin[x][0];
-                        ctx[child].dims[y as usize].pos = cursor_y
-                            + ctx[child].style.margin[y][0]
+                        ctx[child].pos[x] = gap_x
+                            + cursor_x
+                            + ctx[child].style.margin[x].before;
+                        ctx[child].pos[y] = cursor_y
+                            + ctx[child].style.margin[y].before
                             + ctx[child]
                                 .style
                                 .self_align
@@ -778,12 +772,9 @@ impl Ctx {
 
             // NOTE: this will collect all overlaps, the last overlap has the highest
             // priority since is't the top most element.
-            if node
-                .dims
-                .into_iter()
-                .zip(input_state.mouse_pos)
-                .all(|(d, m)| d.pos <= m && m <= d.pos + d.size)
-            {
+            if [Dim::X, Dim::Y].into_iter().zip(input_state.mouse_pos).all(
+                |(d, m)| node.pos[d] <= m && m <= node.pos[d] + node.size[d],
+            ) {
                 self.hovered.push(n);
             }
 
@@ -791,10 +782,10 @@ impl Ctx {
                 buf.push(DrawCmd {
                     elem: n,
                     data: DrawCmdData::Rect(RectCmdData {
-                        x: node.dims[0].pos,
-                        y: node.dims[1].pos,
-                        width: node.dims[0].size,
-                        height: node.dims[1].size,
+                        x: node.pos.x,
+                        y: node.pos.y,
+                        width: node.size.x,
+                        height: node.size.y,
                         color: node.style.bg_color,
                     }),
                 });
@@ -813,27 +804,25 @@ impl Ctx {
                         buf.push(DrawCmd {
                             elem: n,
                             data: DrawCmdData::Text(TextCmdData {
-                                x: node.dims[0].pos
-                                    + node.style.padding.x[0]
-                                    + node
-                                        .style
-                                        .align
-                                        .x
-                                        .offset(node.inner_size(0) - width),
-                                y: node.dims[1].pos
-                                    + node.style.padding.y[0]
+                                x: node.pos.x
+                                    + node.style.padding.x.before
+                                    + node.style.align.x.offset(
+                                        node.inner_size(Dim::X) - width,
+                                    ),
+                                y: node.pos.y
+                                    + node.style.padding.y.before
                                     + node
                                         .style
                                         .align
                                         .y
-                                        .offset(node.inner_size(1) - y)
+                                        .offset(node.inner_size(Dim::Y) - y)
                                     + y_off,
-                                size: ctx[n].style.font_size,
-                                spacing: ctx[n].style.font_spacing,
-                                line_spacing: ctx[n].style.font_line_spacing,
+                                size: node.style.font_size,
+                                spacing: node.style.font_spacing,
+                                line_spacing: node.style.font_line_spacing,
                                 content,
                                 font,
-                                color: ctx[n].style.fg_color,
+                                color: node.style.fg_color,
                             }),
                         });
                     },
@@ -998,10 +987,10 @@ impl core::fmt::Display for FrameCtx {
                 elem.style.text.str(&s.text),
                 elem.style.size.x,
                 elem.style.size.y,
-                elem.dims[0].pos,
-                elem.dims[1].pos,
-                elem.dims[0].size,
-                elem.dims[1].size,
+                elem.pos.x,
+                elem.pos.y,
+                elem.size.x,
+                elem.size.y,
             )?;
 
             if elem.first_child.0 != 0 {
@@ -1146,18 +1135,17 @@ pub struct Elem {
 
     pub style: Style,
 
-    pub dims: [LayoutDim; DIMS],
+    pub pos: Dims<f32>,
+    pub size: Dims<f32>,
 }
 
 impl Elem {
-    pub fn inner_size(&self, dim: impl Into<Dim>) -> f32 {
-        let dim = dim.into();
-        self.dims[dim as usize].size - self.style.padding[dim].sum()
+    pub fn inner_size(&self, dim: Dim) -> f32 {
+        self.size[dim] - self.style.padding[dim].sum()
     }
 
-    pub fn outer_size(&self, dim: impl Into<Dim>) -> f32 {
-        let dim = dim.into();
-        self.dims[dim as usize].size + self.style.margin[dim].sum()
+    pub fn outer_size(&self, dim: Dim) -> f32 {
+        self.size[dim] + self.style.margin[dim].sum()
     }
 }
 
@@ -1191,12 +1179,6 @@ impl ToSize for f32 {
     }
 }
 
-#[derive(Clone, Copy, Default, Debug)]
-pub struct LayoutDim {
-    pub pos: f32,
-    pub size: f32,
-}
-
 impl ElemIdx {
     pub fn next(&mut self, ctx: &FrameCtx) -> Option<ElemIdx> {
         if self.0 == 0 {
@@ -1224,6 +1206,70 @@ impl Align {
             Align::End => 1.,
         }
     }
+}
+
+pub struct StyleScope<'b> {
+    pub ctx: &'b Ctx,
+    pub prev: Style,
+}
+
+impl Drop for StyleScope<'_> {
+    fn drop(&mut self) {
+        self.ctx.style.set(self.prev);
+    }
+}
+
+#[repr(usize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Dim {
+    X,
+    Y,
+}
+
+#[derive(Clone, Copy, Default, Debug, PartialEq, PartialOrd)]
+pub struct Bounds {
+    before: f32,
+    after: f32,
+}
+
+impl Bounds {
+    pub fn sum(self) -> f32 {
+        self.before + self.after
+    }
+}
+
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Dims<T> {
+    pub x: T,
+    pub y: T,
+}
+
+impl<T> Index<Dim> for Dims<T> {
+    type Output = T;
+
+    fn index(&self, index: Dim) -> &Self::Output {
+        match index {
+            Dim::X => &self.x,
+            Dim::Y => &self.y,
+        }
+    }
+}
+
+impl<T> IndexMut<Dim> for Dims<T> {
+    fn index_mut(&mut self, index: Dim) -> &mut Self::Output {
+        match index {
+            Dim::X => &mut self.x,
+            Dim::Y => &mut self.y,
+        }
+    }
+}
+
+pub trait TrueDims {
+    type Elem;
+}
+
+impl<T> TrueDims for Dims<T> {
+    type Elem = T;
 }
 
 macro_rules! derive_style_builder {
@@ -1282,78 +1328,6 @@ macro_rules! derive_style_builder {
     (@ $($tt:tt)*) => {$($tt)*};
 }
 
-pub struct StyleScope<'b> {
-    pub ctx: &'b Ctx,
-    pub prev: Style,
-}
-
-impl Drop for StyleScope<'_> {
-    fn drop(&mut self) {
-        self.ctx.style.set(self.prev);
-    }
-}
-
-#[repr(usize)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Dim {
-    X,
-    Y,
-}
-
-impl From<usize> for Dim {
-    fn from(value: usize) -> Self {
-        match value {
-            0 => Self::X,
-            1 => Self::Y,
-            _ => panic!("dimension index out of bounds"),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Dims<T> {
-    x: T,
-    y: T,
-}
-
-impl<T> Index<Dim> for Dims<T> {
-    type Output = T;
-
-    fn index(&self, index: Dim) -> &Self::Output {
-        match index {
-            Dim::X => &self.x,
-            Dim::Y => &self.y,
-        }
-    }
-}
-
-impl<T> IndexMut<Dim> for Dims<T> {
-    fn index_mut(&mut self, index: Dim) -> &mut Self::Output {
-        match index {
-            Dim::X => &mut self.x,
-            Dim::Y => &mut self.y,
-        }
-    }
-}
-
-trait F32PairExt {
-    fn sum(self) -> f32;
-}
-
-impl F32PairExt for [f32; 2] {
-    fn sum(self) -> f32 {
-        self[0] + self[1]
-    }
-}
-
-pub trait TrueDims {
-    type Elem;
-}
-
-impl<T> TrueDims for Dims<T> {
-    type Elem = T;
-}
-
 derive_style_builder! {
     #[derive(Clone, Copy, Default, Debug)]
     pub struct Style {
@@ -1366,12 +1340,11 @@ derive_style_builder! {
         #[set(min_width, min_height)]
         pub min_size: Dims<f32>,
         #[custom(_)]
-        pub padding: Dims<[f32; 2]>,
+        pub padding: Dims<Bounds>,
         #[custom(_)]
-        pub margin: Dims<[f32; 2]>,
+        pub margin: Dims<Bounds>,
         #[set(scroll_x, scroll_y)]
         pub scroll: Dims<f32>,
-
         pub bg_color: Color,
         pub fg_color: Color,
         pub layout: Layout,
@@ -1393,16 +1366,20 @@ impl Style {
     /// you can pass [padding_left, padding_top, padding_bottom, padding_right],
     /// [padding_x, padding_y], [padding]
     pub fn padding<const SIZE: usize>(mut self, values: [f32; SIZE]) -> Self {
-        self.padding.x = [values[0 % SIZE], values[2 % SIZE]];
-        self.padding.y = [values[1 % SIZE], values[3 % SIZE]];
+        self.padding.x.before = values[0 % SIZE];
+        self.padding.x.after = values[2 % SIZE];
+        self.padding.y.before = values[1 % SIZE];
+        self.padding.y.after = values[3 % SIZE];
         self
     }
 
     /// you can pass [margin_left, margin_top, margin_bottom, margin_right],
     /// [margin_x, margin_y], [margin]
     pub fn margin<const SIZE: usize>(mut self, values: [f32; SIZE]) -> Self {
-        self.margin.x = [values[0 % SIZE], values[2 % SIZE]];
-        self.margin.y = [values[1 % SIZE], values[3 % SIZE]];
+        self.margin.x.before = values[0 % SIZE];
+        self.margin.x.after = values[2 % SIZE];
+        self.margin.y.before = values[1 % SIZE];
+        self.margin.y.after = values[3 % SIZE];
         self
     }
 
