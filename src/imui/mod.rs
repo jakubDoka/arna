@@ -1,5 +1,5 @@
 use {
-    crate::{Checkpoint, SimdSearchIter},
+    crate::{Checkpoint, SimdIter, simd},
     alloc::{string::String, vec::Vec},
     core::{
         cell::{Cell, Ref, RefCell, RefMut},
@@ -13,13 +13,23 @@ use {
 
 pub const DIMS: usize = 2;
 
-#[derive(Default, Debug)]
+/// Shorthand for computing an element id at compiletime
+#[macro_export]
+macro_rules! id {
+    () => { const { id!(file!(), line!(), column!()) } };
+    ($expr:expr $(, $idx:expr)*) => {
+        const { $crate::imui::ElemID($crate::imui::fnv1a(str::as_bytes($expr)))
+             } $(.idx($idx as usize))*
+    };
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct DrawCmd {
     pub elem: ElemIdx,
     pub data: DrawCmdData,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct RectCmdData {
     pub x: f32,
     pub y: f32,
@@ -40,10 +50,8 @@ pub struct TextCmdData {
     pub color: Color,
 }
 
-#[derive(Default, Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub enum DrawCmdData {
-    #[default]
-    Null,
     Rect(RectCmdData),
     Text(TextCmdData),
 }
@@ -220,11 +228,17 @@ pub struct Ctx {
     parent: Cell<ElemIdx>,
     current_elem: Cell<ElemIdx>,
     style: Cell<Style>,
+    elem_index: Vec<u8>,
+    elem_index_ids: Vec<ElemIdx>,
     pub hovered: Vec<ElemIdx>,
     pub measure_cache: MeasureCache,
 }
 
 impl Ctx {
+    pub fn format(&self, args: core::fmt::Arguments) -> TextId {
+        self.frame(0).text.format(args)
+    }
+
     pub fn text<'a>(&'a self, id: TextId) -> Ref<'a, str> {
         Ref::map(self.frames[1].borrow(), |v| v.text.get(id))
     }
@@ -233,14 +247,39 @@ impl Ctx {
         self.frames[offset].borrow_mut()
     }
 
-    pub fn elem<'b>(&'b self, frame: usize, id: ElemIdx) -> RefMut<'b, Elem> {
+    pub fn elem_by_id<'b>(&'b self, id: ElemID) -> RefMut<'b, Elem> {
+        self.elem_mut(1, self.elem_idx_by_id(id))
+    }
+
+    pub fn elem_idx_by_id(&self, id: ElemID) -> ElemIdx {
+        let frame = self.frame(1);
+        SimdIter::new(&self.elem_index[..], id.hash())
+            .map(|idx| self.elem_index_ids[idx])
+            .find(|&i| frame[i].id == id)
+            .unwrap_or_default()
+    }
+
+    pub fn elem<'b>(&'b self, frame: usize, id: ElemIdx) -> Ref<'b, Elem> {
+        Ref::map(self.frames[frame].borrow(), |v| &v[id])
+    }
+
+    pub fn elem_mut<'b>(
+        &'b self,
+        frame: usize,
+        id: ElemIdx,
+    ) -> RefMut<'b, Elem> {
         RefMut::map(self.frames[frame].borrow_mut(), |v| &mut v[id])
     }
 
-    pub fn el(&self, id: impl Into<ElemID>) -> ElemBuilder<'_> {
+    pub fn anon(&self) -> AnonElemBuilder<'_> {
+        AnonElemBuilder(self.el(ElemID(0)))
+    }
+
+    /// If you don't need to access the builder during the styling, prefer `.anon()`
+    pub fn el(&self, id: ElemID) -> ElemBuilder<'_> {
         let mut frame = self.frame(0);
         let idx = frame.add_elem(Elem {
-            id: id.into(),
+            id,
             parent: self.parent.get(),
             style: self.style.get(),
             ..Default::default()
@@ -248,7 +287,7 @@ impl Ctx {
         frame[self.current_elem.get()].next = idx;
         self.current_elem.set(ElemIdx(0));
         self.parent.set(idx);
-        ElemBuilder { ctx: self, idx }
+        ElemBuilder { ctx: self, idx, prev_id: Default::default() }
     }
 
     pub fn push_style(
@@ -440,6 +479,8 @@ impl Ctx {
 
         self.current_elem.take();
         self.parent.take();
+        self.elem_index.clear();
+        self.elem_index_ids.clear();
         self.frames.swap(0, 1);
         self.frames[0].get_mut().elemets.truncate(1);
         self.frames[0].get_mut().text.buf.clear();
@@ -448,19 +489,28 @@ impl Ctx {
         let extra =
             ExtraArr::from(arna.alloc_default(ctx.elemets.len()).unwrap());
 
-        for (elem, extra) in ctx.elemets.iter_mut().zip(&mut extra.0) {
+        for (i, (elem, extra)) in
+            ctx.elemets.iter_mut().zip(&mut extra.0).enumerate()
+        {
+            if elem.id.0 != 0 {
+                self.elem_index.push(elem.id.hash());
+                self.elem_index_ids.push(ElemIdx(i as u32));
+            }
+
             extra.text_hash = fnv1a(ctx.text.get(elem.style.text).as_bytes());
 
-            for (sdim, edim) in
-                elem.style.dims.iter_mut().zip(elem.dims.iter_mut())
+            for (dim, edim) in
+                [Dim::X, Dim::Y].into_iter().zip(elem.dims.iter_mut())
             {
-                if let Size::Fixed(size) = sdim.size.to_size() {
+                if let Size::Fixed(size) = elem.style.size[dim].to_size() {
                     edim.size = size;
                 }
-                edim.size = f32::max(edim.size, sdim.min_size);
-                edim.size = f32::max(edim.size, sdim.padding_sum());
+                edim.size = f32::max(edim.size, elem.style.min_size[dim]);
+                edim.size = f32::max(edim.size, elem.style.padding[dim].sum());
             }
         }
+
+        self.elem_index.resize(simd::align_forward(self.elem_index.len()), 0);
 
         macro_rules! measure_text {
             ($ctx:expr, $node:expr, $width:expr) => {
@@ -483,23 +533,25 @@ impl Ctx {
         {
             Layout::Flex => {
                 let [x, _] = ctx[root].style.direction.dims();
-                if !ctx[root].style.dims[x].size.is_fixed() {
+                if !ctx[root].style.size[x].is_fixed() {
                     let mut iter = ctx[root].first_child;
                     let mut gap_x = 0.;
                     while let Some(child) = iter.next(ctx) {
-                        ctx[root].dims[x].size +=
+                        ctx[root].dims[x as usize].size +=
                             gap_x + ctx[child].outer_size(x);
                         gap_x = ctx[root].style.gap;
                     }
                 }
 
-                for (d, s) in
-                    measure_text!(ctx, root, f32::MAX).into_iter().enumerate()
-                {
-                    if ctx[root].style.dims[d].size.is_fit() {
-                        ctx[root].dims[d].size = f32::max(
-                            ctx[root].dims[d].size,
-                            s + ctx[root].style.dims[d].padding_sum(),
+                for (d, s) in [Dim::X, Dim::Y].into_iter().zip(measure_text!(
+                    ctx,
+                    root,
+                    f32::MAX
+                )) {
+                    if ctx[root].style.size[d].is_fit() {
+                        ctx[root].dims[d as usize].size = f32::max(
+                            ctx[root].dims[d as usize].size,
+                            s + ctx[root].style.padding[d].sum(),
                         );
                     }
                 }
@@ -517,18 +569,19 @@ impl Ctx {
                     let mut gap_x = 0.;
                     while let Some(child) = iter.next(ctx) {
                         if let Size::Perc(p) =
-                            ctx[child].style.dims[y].size.to_size()
+                            ctx[child].style.size[y].to_size()
                         {
-                            ctx[child].dims[y].size = (ctx[root].inner_size(y)
-                                - ctx[child].style.dims[y].margin_sum())
+                            ctx[child].dims[y as usize].size = (ctx[root]
+                                .inner_size(y)
+                                - ctx[child].style.margin[y].sum())
                                 * p;
 
-                            if y == 0 {
+                            if y == Dim::X {
                                 let [_, h] = measure_text!(ctx, child, 0.);
 
-                                ctx[child].dims[x].size = f32::max(
-                                    ctx[child].dims[x].size,
-                                    h + ctx[child].style.dims[x].padding_sum(),
+                                ctx[child].dims[x as usize].size = f32::max(
+                                    ctx[child].dims[x as usize].size,
+                                    h + ctx[child].style.padding[x].sum(),
                                 );
                             }
                         }
@@ -540,8 +593,10 @@ impl Ctx {
                         extra[child].line = line;
 
                         // NOTE: we look ahead so this means we are the first in the row
-                        if free_space < 0. {
-                            ctx[child].dims[x].size += free_space;
+                        if free_space < 0.
+                            && !ctx[child].dims[x as usize].size.is_fixed()
+                        {
+                            ctx[child].dims[x as usize].size += free_space;
                         }
 
                         let mut process_line = iter.0 == 0;
@@ -562,26 +617,31 @@ impl Ctx {
                                 && line_child != iter
                             {
                                 if let Size::Perc(p) =
-                                    ctx[line_child].style.dims[x].size.to_size()
+                                    ctx[line_child].style.size[x].to_size()
                                 {
                                     free_space += ctx[line_child].inner_size(x);
                                     total_perc += p;
                                 }
                             }
 
+                            total_perc = total_perc.max(1.);
+
                             let mut line_iter = line_first;
                             while let Some(line_child) = line_iter.next(ctx)
                                 && line_child != iter
                             {
                                 if let Size::Perc(p) =
-                                    ctx[line_child].style.dims[x].size.to_size()
+                                    ctx[line_child].style.size[x].to_size()
                                 {
-                                    ctx[line_child].dims[x].size = f32::max(
-                                        ctx[line_child].dims[x].size,
-                                        free_space * (p / total_perc)
-                                            + ctx[line_child].style.dims[x]
-                                                .padding_sum(),
-                                    );
+                                    ctx[line_child].dims[x as usize].size =
+                                        f32::max(
+                                            ctx[line_child].dims[x as usize]
+                                                .size,
+                                            free_space * (p / total_perc)
+                                                + ctx[line_child].style.padding
+                                                    [x]
+                                                    .sum(),
+                                        );
                                 }
                             }
 
@@ -639,9 +699,9 @@ impl Ctx {
                         .zip([max_x, max_y])
                         .zip(measure_text!(ctx, root, 0.))
                     {
-                        if ctx[root].style.dims[d].size.is_fit() {
-                            ctx[root].dims[d].size = f32::max(max, td)
-                                + ctx[root].style.dims[d].padding_sum();
+                        if ctx[root].style.size[d].is_fit() {
+                            ctx[root].dims[d as usize].size = f32::max(max, td)
+                                + ctx[root].style.padding[d].sum();
                         }
                     }
                 }
@@ -657,22 +717,21 @@ impl Ctx {
 
                     let mut iter = ctx[root].first_child;
                     let mut cursor_x = 0.;
-                    let mut cursor_y = ctx[root].dims[y].pos
-                        + ctx[root].style.dims[y].align.offset(free_y)
-                        + ctx[root].style.dims[y].padding[0];
+                    let mut cursor_y = ctx[root].dims[y as usize].pos
+                        + ctx[root].style.align[y].offset(free_y)
+                        + ctx[root].style.padding[y][0];
                     let mut y_size = 0.;
                     let mut last_line = u16::MAX;
                     let mut gap_x = 0.;
                     let mut gap_y = 0.;
                     while let Some(child) = iter.next(ctx) {
                         if extra[child].line != last_line {
-                            cursor_x = ctx[root].dims[x].pos
-                                + ctx[root].style.dims[x].align.offset(
-                                    (ctx[root].inner_size(x)
-                                        - extra[child].used_x)
-                                        .abs(),
+                            cursor_x = ctx[root].dims[x as usize].pos
+                                + ctx[root].style.align[x].offset(
+                                    ctx[root].inner_size(x)
+                                        - extra[child].used_x,
                                 )
-                                + ctx[root].style.dims[x].padding[0];
+                                + ctx[root].style.padding[x][0];
                             cursor_y += gap_y + y_size;
                             gap_y = ctx[root].style.gap;
                             y_size = 0.;
@@ -690,11 +749,10 @@ impl Ctx {
                             }
                         }
 
-                        ctx[child].dims[x].pos = gap_x
-                            + cursor_x
-                            + ctx[child].style.dims[x].margin[0];
-                        ctx[child].dims[y].pos = cursor_y
-                            + ctx[child].style.dims[y].margin[0]
+                        ctx[child].dims[x as usize].pos =
+                            gap_x + cursor_x + ctx[child].style.margin[x][0];
+                        ctx[child].dims[y as usize].pos = cursor_y
+                            + ctx[child].style.margin[y][0]
                             + ctx[child]
                                 .style
                                 .self_align
@@ -709,6 +767,8 @@ impl Ctx {
         let mut order = Vec::with_capacity_in(ctx.elemets.len(), &arna);
 
         traverse(ctx, root, Order::Pre, &mut |_, root| order.push(root));
+
+        order.sort_by_key(|&v| ctx[v].style.layer);
 
         self.hovered.clear();
 
@@ -754,14 +814,18 @@ impl Ctx {
                             elem: n,
                             data: DrawCmdData::Text(TextCmdData {
                                 x: node.dims[0].pos
-                                    + node.style.dims[0].padding[0]
-                                    + node.style.dims[0]
+                                    + node.style.padding.x[0]
+                                    + node
+                                        .style
                                         .align
+                                        .x
                                         .offset(node.inner_size(0) - width),
                                 y: node.dims[1].pos
-                                    + node.style.dims[1].padding[0]
-                                    + node.style.dims[1]
+                                    + node.style.padding.y[0]
+                                    + node
+                                        .style
                                         .align
+                                        .y
                                         .offset(node.inner_size(1) - y)
                                     + y_off,
                                 size: ctx[n].style.font_size,
@@ -833,6 +897,8 @@ impl MeasureCache {
         }
         self.len = keep;
 
+        self.hashes[self.len..].fill(0);
+
         self.hits = 0;
     }
 
@@ -850,14 +916,16 @@ impl MeasureCache {
 
         let hash = key.hash();
 
-        let idx = match SimdSearchIter::new(&self.hashes[..], hash)
+        let idx;
+
+        match SimdIter::new_min_aligned(&self.hashes[..], self.len, hash)
             .find(|&i| self.entries[i].key == key)
         {
-            Some(idx) => idx,
+            Some(i) => idx = i,
             None => {
                 let dims = measure();
 
-                let idx = if self.len == self.entries.len() {
+                idx = if self.len == self.entries.len() {
                     let (min_prio, min_idx) = self
                         .entries
                         .iter()
@@ -879,8 +947,6 @@ impl MeasureCache {
                 self.hashes[idx] = hash;
                 self.entries[idx] =
                     MeasureCacheEntry { key, dims, priority: len };
-
-                idx
             }
         };
 
@@ -930,8 +996,8 @@ impl core::fmt::Display for FrameCtx {
                 "({:8x}, {} {}x{} {}x{}/{}x{}) {{",
                 elem.id.0,
                 elem.style.text.str(&s.text),
-                elem.style.dims[0].size,
-                elem.style.dims[1].size,
+                elem.style.size.x,
+                elem.style.size.y,
                 elem.dims[0].pos,
                 elem.dims[1].pos,
                 elem.dims[0].size,
@@ -983,58 +1049,76 @@ impl FrameCtx {
     }
 }
 
+/// .0 == 0 is reserved for anonimous elements
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
 pub struct ElemID(pub u32);
 
-impl From<&'_ str> for ElemID {
-    fn from(value: &'_ str) -> Self {
-        Self(fnv1a(value.as_bytes()))
+impl ElemID {
+    pub fn hash(self) -> u8 {
+        (self.0 as u8).max(1)
     }
-}
 
-impl From<i32> for ElemID {
-    fn from(value: i32) -> Self {
-        Self(value as u32)
+    pub const fn idx(self, value: usize) -> Self {
+        Self(mix_u32(self.0, value as u32))
     }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
 pub struct ElemIdx(pub u32);
 
+#[repr(transparent)]
+pub struct AnonElemBuilder<'a>(pub ElemBuilder<'a>);
+
+impl<'a> AnonElemBuilder<'a> {
+    pub fn style(self, modifier: impl FnOnce(Style) -> Style) -> Self {
+        Self(self.0.style(|_, s| modifier(s)))
+    }
+}
+
 pub struct ElemBuilder<'b> {
     pub ctx: &'b Ctx,
     pub idx: ElemIdx,
+    pub prev_id: Cell<ElemIdx>,
 }
 
 impl<'b> ElemBuilder<'b> {
-    pub fn format(&self, args: core::fmt::Arguments) -> TextId {
-        self.ctx.frame(0).text.format(args)
-    }
-
     pub fn style(self, modifier: impl FnOnce(&Self, Style) -> Style) -> Self {
         let mut style = self.ctx.elem(0, self.idx).style;
         style = modifier(&self, style);
-        self.ctx.elem(0, self.idx).style = style;
+        self.ctx.elem_mut(0, self.idx).style = style;
 
         self
     }
 
-    pub fn idx(self, value: usize) -> Self {
-        let mut elem = self.ctx.elem(0, self.idx);
-        elem.id.0 = mix_u32(elem.id.0, value as u32);
-        self
+    pub fn id(&self) -> ElemID {
+        let id = self.ctx.elem(0, self.idx).id;
+        debug_assert!(
+            id.0 != 0,
+            "this operation is not supported on anonimous\
+            elements, use .el(id!()) at least (performance reasons)"
+        );
+        id
+    }
+
+    pub fn prev(&self) -> Ref<'b, Elem> {
+        let id = self.id();
+        if self.prev_id.get().0 == 0 {
+            self.prev_id.set(self.ctx.elem_idx_by_id(id));
+        }
+        self.ctx.elem(1, self.prev_id.get())
     }
 
     pub fn hovered(&self) -> bool {
-        self.ctx.hovered.last().map_or(false, |&n| {
-            self.ctx.elem(1, n).id == self.ctx.elem(0, self.idx).id
-        })
+        self.ctx
+            .hovered
+            .last()
+            .map_or(false, |&n| self.ctx.elem(1, n).id == self.id())
     }
 
     /// This is ture for any element that overlaps with mouse
     pub fn any_hovered(&self) -> bool {
-        let curr = self.ctx.elem(0, self.idx);
-        self.ctx.hovered.iter().any(|&n| self.ctx.elem(1, n).id == curr.id)
+        let id = self.id();
+        self.ctx.hovered.iter().any(|&n| self.ctx.elem(1, n).id == id)
     }
 
     pub fn scope<T>(self, content: impl FnOnce(Self) -> T) -> T {
@@ -1044,8 +1128,8 @@ impl<'b> ElemBuilder<'b> {
 
 impl Drop for ElemBuilder<'_> {
     fn drop(&mut self) {
-        self.ctx.parent.set(self.ctx.elem(0, self.idx).parent);
-        let mut parent = self.ctx.elem(0, self.ctx.parent.get());
+        self.ctx.parent.set(self.ctx.elem_mut(0, self.idx).parent);
+        let mut parent = self.ctx.elem_mut(0, self.ctx.parent.get());
         if parent.first_child.0 == 0 {
             parent.first_child = self.idx;
         }
@@ -1062,16 +1146,18 @@ pub struct Elem {
 
     pub style: Style,
 
-    dims: [LayoutDim; DIMS],
+    pub dims: [LayoutDim; DIMS],
 }
 
 impl Elem {
-    pub fn inner_size(&self, dim: usize) -> f32 {
-        self.dims[dim].size - self.style.dims[dim].padding_sum()
+    pub fn inner_size(&self, dim: impl Into<Dim>) -> f32 {
+        let dim = dim.into();
+        self.dims[dim as usize].size - self.style.padding[dim].sum()
     }
 
-    pub fn outer_size(&self, dim: usize) -> f32 {
-        self.dims[dim].size + self.style.dims[dim].margin_sum()
+    pub fn outer_size(&self, dim: impl Into<Dim>) -> f32 {
+        let dim = dim.into();
+        self.dims[dim as usize].size + self.style.margin[dim].sum()
     }
 }
 
@@ -1105,17 +1191,10 @@ impl ToSize for f32 {
     }
 }
 
-pub static GROW: f32 = perc(1.);
-
-pub const fn perc(vl: f32) -> f32 {
-    debug_assert!(vl >= 0.0);
-    -vl
-}
-
 #[derive(Clone, Copy, Default, Debug)]
-struct LayoutDim {
-    pos: f32,
-    size: f32,
+pub struct LayoutDim {
+    pub pos: f32,
+    pub size: f32,
 }
 
 impl ElemIdx {
@@ -1151,37 +1230,56 @@ macro_rules! derive_style_builder {
     (
         $(#[$meta:meta])*
         $vis:vis struct $name:ident {
-            pub dims: [StyleDim; DIMS],
-
             $(
-                $(#[$field_mod:ident])?
+                $(#[set($dim_field_mod_x:ident, $dim_field_mod_y:ident)])?
+                $(#[conv($field_mod:ident)])?
+                $(#[custom($custom_marker:tt)])?
                 $field_vis:vis $field_name:ident: $field_type:ty,
             )*
         }
     ) => {
-
         $(#[$meta])*
         $vis struct $name {
-            pub dims: [StyleDim; DIMS],
-
             $(
                 $field_vis $field_name: $field_type,
             )*
         }
 
-        impl $name {
-            $(
-                $field_vis fn $field_name(mut self, value:
-                    derive_style_builder!(@$($field_mod)? $field_type)) -> Self {
-                    self.$field_name = value.into();
-                    self
+        $(
+            derive_style_builder!(@$(custom($custom_marker))?
+                impl $name {
+                        $field_vis fn $field_name(mut self, value:
+                            derive_style_builder!(@$($field_mod)? $field_type)) -> Self {
+                            self.$field_name = value.into();
+                            self
+                        }
                 }
-            )*
-        }
+            );
+        )*
+
+        $(
+            derive_style_builder!(@dim_set x $(name $dim_field_mod_x)? $name,
+                $field_vis, $field_name, $field_type);
+            derive_style_builder!(@dim_set y $(name $dim_field_mod_y)? $name,
+                $field_vis, $field_name, $field_type);
+        )*
     };
 
     (@into $field_type:ty) => {impl Into<$field_type>};
-    (@ $field_type:ty) => {$field_type};
+    (@dim_set $idx:ident name $name:ident $typename:ident, $vis:vis,
+        $field_name:ident, $dim_field_type:ty) => {
+        impl $typename {
+            $vis fn $name(mut self, value:
+               <$dim_field_type as TrueDims>::Elem) -> Self {
+                self.$field_name.$idx = value;
+                self
+            }
+        }
+    };
+    (@dim_set $idx:ident $typename:ident, $vis:vis,
+        $field_name:ident, $dim_field_type:ty) => {};
+    (@custom(_) $($tt:tt)*) => {};
+    (@ $($tt:tt)*) => {$($tt)*};
 }
 
 pub struct StyleScope<'b> {
@@ -1195,130 +1293,181 @@ impl Drop for StyleScope<'_> {
     }
 }
 
+#[repr(usize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Dim {
+    X,
+    Y,
+}
+
+impl From<usize> for Dim {
+    fn from(value: usize) -> Self {
+        match value {
+            0 => Self::X,
+            1 => Self::Y,
+            _ => panic!("dimension index out of bounds"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Dims<T> {
+    x: T,
+    y: T,
+}
+
+impl<T> Index<Dim> for Dims<T> {
+    type Output = T;
+
+    fn index(&self, index: Dim) -> &Self::Output {
+        match index {
+            Dim::X => &self.x,
+            Dim::Y => &self.y,
+        }
+    }
+}
+
+impl<T> IndexMut<Dim> for Dims<T> {
+    fn index_mut(&mut self, index: Dim) -> &mut Self::Output {
+        match index {
+            Dim::X => &mut self.x,
+            Dim::Y => &mut self.y,
+        }
+    }
+}
+
+trait F32PairExt {
+    fn sum(self) -> f32;
+}
+
+impl F32PairExt for [f32; 2] {
+    fn sum(self) -> f32 {
+        self[0] + self[1]
+    }
+}
+
+pub trait TrueDims {
+    type Elem;
+}
+
+impl<T> TrueDims for Dims<T> {
+    type Elem = T;
+}
+
 derive_style_builder! {
     #[derive(Clone, Copy, Default, Debug)]
     pub struct Style {
-        pub dims: [StyleDim; DIMS],
+        #[set(align_x, align_y)]
+        pub align: Dims<Align>,
+        #[set(width, height)]
+        pub size: Dims<f32>,
+        #[set(offset_x, offset_y)]
+        pub offset: Dims<f32>,
+        #[set(min_width, min_height)]
+        pub min_size: Dims<f32>,
+        #[custom(_)]
+        pub padding: Dims<[f32; 2]>,
+        #[custom(_)]
+        pub margin: Dims<[f32; 2]>,
+        #[set(scroll_x, scroll_y)]
+        pub scroll: Dims<f32>,
+
         pub bg_color: Color,
         pub fg_color: Color,
         pub layout: Layout,
         pub direction: Direction,
-        pub dont_wrap: bool,
-        #[into]
+        #[conv(into)]
         pub text: TextId,
         pub self_align: Align,
         pub gap: f32,
-        #[into]
+        #[conv(into)]
         pub font: Option<FontId>,
         pub font_size: f32,
         pub font_spacing: f32,
         pub font_line_spacing: f32,
+        pub layer: u32,
     }
 }
 
 impl Style {
-    pub fn align_x(mut self, value: Align) -> Self {
-        self.dims[0].align = value;
-        self
-    }
-
-    pub fn align_y(mut self, value: Align) -> Self {
-        self.dims[1].align = value;
-        self
-    }
-
     /// you can pass [padding_left, padding_top, padding_bottom, padding_right],
     /// [padding_x, padding_y], [padding]
     pub fn padding<const SIZE: usize>(mut self, values: [f32; SIZE]) -> Self {
-        self.dims[0].padding = [values[0 % SIZE], values[2 % SIZE]];
-        self.dims[1].padding = [values[1 % SIZE], values[3 % SIZE]];
+        self.padding.x = [values[0 % SIZE], values[2 % SIZE]];
+        self.padding.y = [values[1 % SIZE], values[3 % SIZE]];
         self
     }
 
     /// you can pass [margin_left, margin_top, margin_bottom, margin_right],
     /// [margin_x, margin_y], [margin]
     pub fn margin<const SIZE: usize>(mut self, values: [f32; SIZE]) -> Self {
-        self.dims[0].margin = [values[0 % SIZE], values[2 % SIZE]];
-        self.dims[1].margin = [values[1 % SIZE], values[3 % SIZE]];
-        self
-    }
-
-    pub fn min_width_px(mut self, value: usize) -> Self {
-        self.dims[0].min_size = value as f32;
-        self
-    }
-
-    pub fn width_px(mut self, value: usize) -> Self {
-        self.dims[0].size = value as f32;
+        self.margin.x = [values[0 % SIZE], values[2 % SIZE]];
+        self.margin.y = [values[1 % SIZE], values[3 % SIZE]];
         self
     }
 
     pub fn width_fit(mut self) -> Self {
-        self.dims[0].size = 0.;
-        self
-    }
-
-    pub fn width_perc(mut self, value: f32) -> Self {
-        self.dims[0].size = perc(value);
-        self
-    }
-
-    pub fn width_grow(mut self) -> Self {
-        self.dims[0].size = -1.;
-        self
-    }
-
-    pub fn height_px(mut self, value: usize) -> Self {
-        self.dims[1].size = value as f32;
-        self
-    }
-
-    pub fn height_perc(mut self, value: f32) -> Self {
-        self.dims[1].size = perc(value);
-        self
-    }
-
-    pub fn height_grow(mut self) -> Self {
-        self.dims[1].size = -1.;
+        self.size.x = 0.;
         self
     }
 
     pub fn height_fit(mut self) -> Self {
-        self.dims[1].size = 0.;
+        self.size.y = 0.;
         self
     }
 
-    pub fn gap_px(mut self, value: usize) -> Self {
-        self.gap = value as f32;
+    pub fn width_perc(mut self, value: f32) -> Self {
+        self.size.x = -value;
         self
     }
-}
 
-#[derive(Clone, Copy, Default, Debug)]
-pub struct StyleDim {
-    pub align: Align,
-    pub size: f32,
-    pub min_size: f32,
-    pub padding: [f32; 2],
-    pub margin: [f32; 2],
-}
-
-impl StyleDim {
-    pub fn padding_sum(&self) -> f32 {
-        self.padding[0] + self.padding[1]
+    pub fn height_perc(mut self, value: f32) -> Self {
+        self.size.y = -value;
+        self
     }
 
-    pub fn margin_sum(&self) -> f32 {
-        self.margin[0] + self.margin[1]
+    pub fn width_grow(mut self) -> Self {
+        self.size.x = -1.;
+        self
+    }
+
+    pub fn height_grow(mut self) -> Self {
+        self.size.y = -1.;
+        self
     }
 }
 
 pub type Color = u32;
 
-pub const RED: Color = 0xff0000ff;
-pub const GREEN: Color = 0x00ff00ff;
-pub const BLUE: Color = 0x0000ffff;
-pub const WHITE: Color = 0xffffffff;
+pub const RED: Color = 0xfb532bff;
+pub const GREEN: Color = 0x91fb2bff;
+pub const BLUE: Color = 0x1064ffff;
+pub const WHITE: Color = 0xebebebff;
+
+pub const fn lerp_color(a: Color, b: Color, t: f32) -> Color {
+    let mut out = 0;
+
+    let mut i = 0;
+    while i < 4 {
+        let shift = i * 8;
+        let a = ((a >> shift) & 0xff) as f32;
+        let b = ((b >> shift) & 0xff) as f32;
+        let v = lerp(a, b, t);
+
+        out |= (v as u32) << shift;
+        i += 1;
+    }
+
+    out
+}
+
+pub const fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    if (a - b).abs() <= 1. {
+        return b;
+    }
+
+    a + (b - a) * t
+}
 
 pub const fn fnv1a(bytes: &[u8]) -> u32 {
     const OFFSET_BASIS: u32 = 0x811c9dc5;
@@ -1360,10 +1509,10 @@ pub enum Direction {
 }
 
 impl Direction {
-    pub fn dims(self) -> [usize; DIMS] {
+    pub fn dims(self) -> [Dim; DIMS] {
         match self {
-            Direction::Left2Right => [0, 1],
-            Direction::Top2Bottom => [1, 0],
+            Direction::Left2Right => [Dim::X, Dim::Y],
+            Direction::Top2Bottom => [Dim::Y, Dim::X],
         }
     }
 }

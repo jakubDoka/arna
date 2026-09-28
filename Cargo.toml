@@ -8,7 +8,12 @@ description = "Collection of handmade libraries."
 [dependencies]
 
 [profile.release]
-debug = true
+debug = false
+strip = true
+lto = "fat"
+codegen-units = 1
+opt-level = "z"
+panic = "abort"
 
 [features]
 default = ["alloc", "virtual", "std"]

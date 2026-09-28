@@ -20,6 +20,10 @@ pub mod dynlib;
 pub mod imui;
 
 pub mod simd {
+    pub fn align_forward(len: usize) -> usize {
+        (len + SIZE - 1) & !(SIZE - 1)
+    }
+
     cfg_select! {
         target_feature = "avx2" => {
             pub const SIZE: usize = 32;
@@ -261,9 +265,9 @@ impl<'a, T> OwnedSlice<'a, T> {
     }
 }
 
-impl<'a, T: Copy> Into<&'a mut [T]> for OwnedSlice<'a, T> {
-    fn into(self) -> &'a mut [T] {
-        self.leak()
+impl<'a, T: Copy> From<OwnedSlice<'a, T>> for &'a mut [T] {
+    fn from(val: OwnedSlice<'a, T>) -> Self {
+        val.leak()
     }
 }
 
@@ -657,25 +661,29 @@ unsafe impl<'a> Allocator for Checkpoint<'a> {
     }
 }
 
-pub struct SimdSearchIter<'a, T> {
+pub struct SimdIter<'a, T> {
     data: &'a [T],
     needle: T,
     index: usize,
     mask: u32,
 }
 
-impl<'a, T: Copy> SimdSearchIter<'a, T> {
+impl<'a, T: Copy> SimdIter<'a, T> {
     pub fn new(data: &'a [T], needle: T) -> Self {
         assert!(data.len() % simd::SIZE == 0);
         const { assert!(std::mem::size_of::<T>() == 1) };
         Self { data, needle, mask: 0, index: 0 }
     }
+
+    pub fn new_min_aligned(data: &'a [T], len: usize, needle: T) -> Self {
+        Self::new(&data[..simd::align_forward(len)], needle)
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
-impl<'a, T: Copy> SimdSearchIter<'a, T> {}
+impl<'a, T: Copy> SimdIter<'a, T> {}
 
-impl<'a, T: Copy> Iterator for SimdSearchIter<'a, T> {
+impl<'a, T: Copy> Iterator for SimdIter<'a, T> {
     type Item = usize;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -704,7 +712,7 @@ impl<'a, T: Copy> Iterator for SimdSearchIter<'a, T> {
 #[cfg(test)]
 pub mod tests {
     use {
-        crate::{Arna, SimdSearchIter},
+        crate::{Arna, SimdIter},
         core::pin::pin,
     };
 
@@ -713,15 +721,15 @@ pub mod tests {
         let bytes =
             b"0123456789abcdefghijklmnopqrstuvwxyz-!?*(){}&abc================";
 
-        let mut iter = SimdSearchIter::new(bytes, b'0');
+        let mut iter = SimdIter::new(bytes, b'0');
         assert_eq!(iter.next(), Some(0));
         assert_eq!(iter.next(), None);
 
-        let mut iter = SimdSearchIter::new(bytes, b'l');
+        let mut iter = SimdIter::new(bytes, b'l');
         assert_eq!(iter.next(), Some(21));
         assert_eq!(iter.next(), None);
 
-        let mut iter = SimdSearchIter::new(bytes, b'a');
+        let mut iter = SimdIter::new(bytes, b'a');
         assert_eq!(iter.next(), Some(10));
         assert_eq!(iter.next(), Some(45));
         assert_eq!(iter.next(), None);

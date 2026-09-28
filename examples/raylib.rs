@@ -2,10 +2,11 @@ use {
     arna::{
         Arna, TEMP_ARENAS, TempArenas, aformat,
         dynlib::DynamicLibrary,
+        id,
         imui::{
             Align, BLUE, BackendBase, Color, Ctx, Direction::Top2Bottom,
             DrawCmdData, FontId, GREEN, Glyph, InputState, Layout::Flex, RED,
-            RectCmdData, TextCmdData, WHITE,
+            RectCmdData, TextCmdData, WHITE, lerp, lerp_color,
         },
     },
     core::{
@@ -193,11 +194,11 @@ pub struct IndexedFont {
 
 // TODO: this only works because the char count in default font is % 16
 pub fn char_hash(char: char) -> u8 {
-    arna::imui::mix_u32(char as u32, 0) as u8
+    (arna::imui::mix_u32(char as u32, 0) as u8).max(1)
 }
 
 pub fn get_glyph_index(font: &IndexedFont, char: char) -> Option<usize> {
-    arna::SimdSearchIter::new(&font.index, char_hash(char))
+    arna::SimdIter::new(&font.index, char_hash(char))
         .find(|&idx| unsafe { (*font.font.glyphs.add(idx)).value == char })
 }
 
@@ -401,43 +402,42 @@ extern "C" fn run(app: &mut App) {
                 .font_line_spacing(2.)
         });
 
-        let _el = ctx.el(0).style(|i, s| {
-            s.width_px(unsafe { get_screen_width() } as usize)
-                .height_px(unsafe { get_screen_height() } as usize)
-                .fg_color(if i.hovered() { RED } else { WHITE })
+        let _el = ctx.anon().style(|s| {
+            s.width(unsafe { get_screen_width() } as f32)
+                .height(unsafe { get_screen_height() } as f32)
                 .layout(Flex)
-                //.align_y(Align::Center)
+                .align_y(Align::Center)
                 .direction(Top2Bottom)
-                .text(include_str!("raylib.rs"))
+            //.text(include_str!("raylib.rs"))
         });
 
-        if false {
-            let _wrap = ctx.el(0).style(|_, s| {
+        if true {
+            let _wrap = ctx.anon().style(|s| {
                 s.width_perc(1.)
                     .bg_color(BLUE)
                     .align_x(Align::Center)
-                    .gap_px(10)
-                    .gap_px(0)
+                    .gap(10.)
+                    .gap(0.)
             });
 
             for _ in 0..300 {
-                ctx.el(0).style(|_, s| s.width_px(1).bg_color(RED));
+                ctx.anon().style(|s| s.width(1.).bg_color(RED));
             }
 
             for _ in 0..3 {
                 let _foo =
-                    ctx.el(0).style(|_, s| s.width_px(4 * 30).bg_color(GREEN));
+                    ctx.anon().style(|s| s.width(4. * 30.).bg_color(GREEN));
 
                 for _ in 0..30 {
-                    ctx.el(0).style(|_, s| s.width_px(1).bg_color(RED));
+                    ctx.anon().style(|s| s.width(1.).bg_color(RED));
                 }
 
-                ctx.el(0).style(|_, s| s.width_grow().bg_color(RED));
+                ctx.anon().style(|s| s.width_grow().bg_color(RED));
             }
 
             {
-                let _ss = ctx.el("proba").style(|i, s| {
-                    s.gap_px(4).bg_color(if i.any_hovered() {
+                let _ss = ctx.el(id!("proba")).style(|i, s| {
+                    s.gap(4.).bg_color(if i.any_hovered() {
                         RED
                     } else {
                         GREEN
@@ -445,7 +445,7 @@ extern "C" fn run(app: &mut App) {
                 });
 
                 for i in 0..16 {
-                    ctx.el("brahma").idx(i).style(|i, s| {
+                    ctx.el(id!("brahma").idx(i)).style(|i, s| {
                         s.margin([0.]).bg_color(if i.hovered() {
                             WHITE
                         } else {
@@ -455,14 +455,13 @@ extern "C" fn run(app: &mut App) {
                 }
             }
 
-            ctx.el(0)
-                .style(|_, s| s.text("Lorem ipsum and so on").bg_color(WHITE));
+            ctx.anon()
+                .style(|s| s.text("Lorem ipsum and so on").bg_color(WHITE));
 
             {
-                let _lup =
-                    ctx.el(0).style(|_, s| s.bg_color(GREEN).width_px(100));
+                let _lup = ctx.anon().style(|s| s.bg_color(GREEN).width(100.));
 
-                ctx.el(0).style(|_, s| {
+                ctx.anon().style(|s| {
                     s.text("there is enought text to overflow")
                         .bg_color(WHITE)
                         .width_grow()
@@ -470,50 +469,66 @@ extern "C" fn run(app: &mut App) {
             }
         }
 
-        for i in 0..0 {
-            let _wrap = ctx.el(0).style(|_, s| {
+        for i in 0..1 {
+            let _wrap = ctx.anon().style(|s| {
                 s.width_perc(1.)
                     .bg_color(BLUE)
                     .align_x(Align::Center)
                     .direction(Top2Bottom)
-                    .gap_px(10)
+                    .gap(10.)
             });
 
             let ss =
-                ctx.push_style(|s| s.width_px(40).height_fit().bg_color(GREEN));
+                ctx.push_style(|s| s.width(40.).height_fit().bg_color(GREEN));
 
             for j in i * 2..i * 2 + 2 {
                 if ctx
-                    .el("btn")
-                    .idx(j)
+                    .el(id!("btn", j))
                     .style(|b, s| {
                         s.text(if b.hovered() {
-                            aformat!(b, "no {j}")
+                            aformat!(ctx, "no {j}")
                         } else {
                             "yes".into()
                         })
                         .bg_color(if b.hovered() { RED } else { WHITE })
-                        .min_width_px(30)
+                        .min_width(30.)
                         .width_perc(1.)
                         .align_x(Align::End)
                     })
                     .hovered()
                     && unsafe { is_mouse_button_pressed(MouseButton::Left) }
                 {
-                    println!("yayayay {j}")
+                    println!("yayayay {j} {:?}", ctx.elem_by_id(id!("btn", j)))
                 }
 
+                let _foo = ctx.anon().style(|s| {
+                    s.width(50.)
+                        .height(50.)
+                        .padding([0.])
+                        .align_x(Align::Center)
+                        .self_align(Align::Center)
+                });
+
                 if ctx
-                    .el("btn-2")
-                    .idx(j)
+                    .el(id!("btn-2", j))
                     .style(|b, s| {
+                        let p = b.prev();
+                        let target = if b.hovered() { RED } else { GREEN };
+                        let width_target = if b.hovered() { 100. } else { 50. };
+                        let height_target =
+                            if !b.hovered() { 50. } else { 100. };
                         s.text(if b.hovered() {
-                            aformat!(b, "no {i}")
+                            aformat!(ctx, "no {i}")
                         } else {
                             "yes".into()
                         })
+                        .margin([0.])
+                        .bg_color(lerp_color(p.style.bg_color, target, 0.2))
+                        .width(lerp(p.dims[0].size, width_target, 0.3))
+                        .height(lerp(p.dims[1].size, height_target, 0.3))
                         .self_align(Align::Center)
                         .align_x(Align::Center)
+                        .layer(1)
                     })
                     .hovered()
                     && unsafe { is_mouse_button_pressed(MouseButton::Left) }
@@ -560,7 +575,6 @@ extern "C" fn run(app: &mut App) {
                     conv_color(color),
                 );
             },
-            DrawCmdData::Null => {}
         }
     }
 
@@ -591,6 +605,8 @@ pub fn main() {
     for i in 0..font.font.glyph_count as usize {
         font.index.push(char_hash(unsafe { (*font.font.glyphs.add(i)).value }));
     }
+
+    font.index.resize(arna::simd::align_forward(font.index.len()), 0);
 
     let mut app = App {
         ctx: Ctx::default(),
