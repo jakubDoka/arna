@@ -1,7 +1,7 @@
 use {
     arna::{
-        Arna, TEMP_ARENAS, TempArenas, aformat,
-        dynlib::DynamicLibrary,
+        Arna, aformat,
+        dynlib::hot::Module,
         id,
         imui::{
             Align, BLUE, BackendBase, Color, Ctx, Direction::Top2Bottom,
@@ -11,139 +11,17 @@ use {
     },
     core::{
         array,
-        ffi::c_char,
-        mem::{MaybeUninit, transmute},
+        ffi::{c_char, c_void},
+        mem::MaybeUninit,
     },
-    std::{
-        path::PathBuf, ptr::NonNull, sync::atomic::AtomicPtr, time::SystemTime,
-    },
+    std::ptr::NonNull,
 };
 
 pub struct App {
     font: FontId,
+    _font_data: Box<IndexedFont>,
     ctx: Ctx,
     backend: RaylibBackend,
-}
-
-type RunFn = unsafe extern "C" fn(&mut App);
-
-#[derive(Default)]
-pub struct Module {
-    last_mod: Option<SystemTime>,
-    changing_files: Vec<PathBuf>,
-    libs: Vec<DynamicLibrary>,
-    lib_paths: Vec<PathBuf>,
-    run: *mut RunFn,
-}
-
-impl Drop for Module {
-    fn drop(&mut self) {
-        self.libs.clear();
-        for path in &self.lib_paths {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-}
-
-impl Module {
-    pub fn reload(&mut self) {
-        let should_reload;
-
-        if self.changing_files.len() == 0 {
-            should_reload = true;
-        } else {
-            let mut last_mod = SystemTime::UNIX_EPOCH;
-            for path in self.changing_files.iter() {
-                let mod_time = path
-                    .metadata()
-                    .and_then(|m| m.modified())
-                    .unwrap_or(SystemTime::UNIX_EPOCH);
-                last_mod = last_mod.max(mod_time);
-            }
-
-            should_reload =
-                self.last_mod.unwrap_or(SystemTime::UNIX_EPOCH) < last_mod;
-            self.last_mod = Some(last_mod);
-        };
-
-        let dir = if cfg!(debug_assertions) { "debug" } else { "release" };
-
-        if should_reload {
-            let status = std::process::Command::new("cargo")
-                .args([
-                    "build",
-                    "--example",
-                    "raylib-lib",
-                    "--features",
-                    "example-link-raylib,dll",
-                ])
-                .args(cfg!(not(debug_assertions)).then(|| "--release"))
-                .status()
-                .unwrap();
-
-            if !status.success() {
-                return;
-            }
-
-            let built_lib = PathBuf::from(format!("target/{dir}/examples"))
-                .join(format!(
-                    "{}raylib_lib{}",
-                    std::env::consts::DLL_PREFIX,
-                    std::env::consts::DLL_SUFFIX,
-                ));
-            let hot_lib = built_lib.with_file_name(format!(
-                "{}raylib_lib.hot-{}{}",
-                std::env::consts::DLL_PREFIX,
-                self.libs.len(),
-                std::env::consts::DLL_SUFFIX,
-            ));
-            std::fs::copy(&built_lib, &hot_lib).unwrap();
-
-            let lib = DynamicLibrary::open(Some(&hot_lib)).unwrap();
-
-            let tmp_arenas_override = unsafe {
-                lib.symbol::<AtomicPtr<TempArenas>>("ARNA_TEMP_ARENAS_OVERRIDE")
-                    .unwrap()
-            };
-            unsafe {
-                tmp_arenas_override.as_ref().unwrap().store(
-                    &TEMP_ARENAS as *const _ as *mut _,
-                    core::sync::atomic::Ordering::Relaxed,
-                );
-            };
-
-            self.run = unsafe { lib.symbol("run") }.unwrap();
-
-            self.libs.push(lib);
-            self.lib_paths.push(hot_lib);
-
-            self.changing_files.clear();
-
-            let used_files = std::fs::read_to_string(format!(
-                "target/{dir}/examples/libraylib_lib.d"
-            ))
-            .unwrap();
-
-            self.changing_files.extend(
-                used_files
-                    .split_whitespace()
-                    .skip(1)
-                    .filter(|v| !v.is_empty())
-                    .map(|s| PathBuf::from(s)),
-            );
-            self.last_mod = self
-                .changing_files
-                .iter()
-                .filter_map(|path| {
-                    path.metadata().and_then(|m| m.modified()).ok()
-                })
-                .max();
-        }
-    }
-
-    pub unsafe fn run(&mut self, state: &mut App) {
-        unsafe { transmute::<_, RunFn>(self.run)(state) }
-    }
 }
 
 #[allow(improper_ctypes)]
@@ -200,6 +78,36 @@ pub fn char_hash(char: char) -> u8 {
 pub fn get_glyph_index(font: &IndexedFont, char: char) -> Option<usize> {
     arna::SimdIter::new(&font.index, char_hash(char))
         .find(|&idx| unsafe { (*font.font.glyphs.add(idx)).value == char })
+}
+
+impl App {
+    fn new() -> Self {
+        let mut font = Box::new(IndexedFont {
+            font: unsafe { get_font_default() },
+            index: vec![],
+        });
+
+        for i in 0..font.font.glyph_count as usize {
+            font.index
+                .push(char_hash(unsafe { (*font.font.glyphs.add(i)).value }));
+        }
+        font.index.resize(arna::simd::align_forward(font.index.len()), 0);
+
+        Self {
+            ctx: Ctx::default(),
+            font: FontId(NonNull::from_ref(&*font).cast()),
+            _font_data: font,
+            backend: RaylibBackend,
+        }
+    }
+}
+
+fn init_temp_arenas() {
+    Arna::init_temp_arenas(array::from_fn(|_| {
+        Arna::from(
+            vec![MaybeUninit::<u8>::uninit(); 1024 * 1024].into_boxed_slice(),
+        )
+    }));
 }
 
 pub fn draw_text_ex(
@@ -388,7 +296,26 @@ impl BackendBase for RaylibBackend {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn run(app: &mut App) {
+extern "C" fn create() -> *mut c_void {
+    Box::into_raw(Box::new(App::new())).cast()
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn destroy(state: *mut c_void) {
+    drop(unsafe { Box::from_raw(state.cast::<App>()) });
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn state_version() -> usize {
+    1
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn run(state: *mut c_void) {
+    render(unsafe { &mut *state.cast::<App>() });
+}
+
+fn render(app: &mut App) {
     let ctx = &mut app.ctx;
 
     {
@@ -593,28 +520,21 @@ pub fn main() {
     unsafe { init_window(800, 600, c"Arna IMUI example".as_ptr()) };
     unsafe { set_target_fps(60) };
 
-    crate::Arna::init_temp_arenas(array::from_fn(|_| {
-        crate::Arna::from(
-            vec![MaybeUninit::<u8>::uninit(); 1024 * 1024].into_boxed_slice(),
-        )
-    }));
+    init_temp_arenas();
 
-    let mut font =
-        IndexedFont { font: unsafe { get_font_default() }, index: vec![] };
-
-    for i in 0..font.font.glyph_count as usize {
-        font.index.push(char_hash(unsafe { (*font.font.glyphs.add(i)).value }));
-    }
-
-    font.index.resize(arna::simd::align_forward(font.index.len()), 0);
-
-    let mut app = App {
-        ctx: Ctx::default(),
-        font: FontId(NonNull::from_ref(&font).cast()),
-        backend: RaylibBackend,
-    };
-
-    let mut module = Module::default();
+    let mut app = App::new();
+    let mut module = Module::new(
+        "create",
+        "destroy",
+        "state_version",
+        [
+            "build",
+            "--example",
+            "raylib-lib",
+            "--features",
+            "example-link-raylib,dll",
+        ],
+    );
 
     while !unsafe { window_should_close() } {
         unsafe { begin_drawing() };
@@ -623,10 +543,10 @@ pub fn main() {
         };
 
         if cfg!(debug_assertions) {
-            module.reload();
-            unsafe { module.run(&mut app) };
+            unsafe { module.reload_if_changed() };
+            unsafe { module.call("run").unwrap() };
         } else {
-            run(&mut app);
+            render(&mut app);
         }
 
         unsafe { end_drawing() };
