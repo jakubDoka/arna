@@ -15,7 +15,7 @@ use {
         ffi::{c_char, c_void},
         mem::MaybeUninit,
     },
-    std::ptr::NonNull,
+    std::{ptr::NonNull, time::Instant},
 };
 
 pub struct App {
@@ -396,7 +396,7 @@ fn render(app: &mut App) {
                     .gap(0.)
             });
 
-            for _ in 0..5000 {
+            for _ in 0..10000 {
                 ctx.anon().style(|s| s.width(1.).bg_color(RED));
             }
 
@@ -581,7 +581,8 @@ pub fn main() {
 
     Arna::init_temp_arenas(array::from_fn(|_| {
         Arna::from(
-            vec![MaybeUninit::<u8>::uninit(); 1024 * 1024].into_boxed_slice(),
+            vec![MaybeUninit::<u8>::uninit(); 1024 * 1024 * 16]
+                .into_boxed_slice(),
         )
     }));
 
@@ -609,7 +610,13 @@ pub fn main() {
             unsafe { module.reload_if_changed() };
             unsafe { module.call("run").unwrap() };
         } else {
+            //let now = Instant::now();
             render(&mut app);
+            //println!(
+            //    " {:?} {:?}",
+            //    now.elapsed(),
+            //    app.ctx.frame(1).elemets.len()
+            //);
         }
 
         //unsafe { end_drawing() };

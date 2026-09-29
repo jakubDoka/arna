@@ -924,6 +924,7 @@ impl Ctx {
                     );
                 }
             }
+
             buf.leak()
         } else {
             &mut []
@@ -1055,7 +1056,7 @@ impl Default for MeasureCache {
 
 #[derive(Debug)]
 pub struct FrameCtx {
-    elemets: Vec<Elem>,
+    pub elemets: Vec<Elem>,
     text: TextBuf,
     state: StateHolder,
 }
