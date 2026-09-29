@@ -1,7 +1,11 @@
 use {
-    crate::{Checkpoint, SimdIter, simd},
+    crate::{
+        Checkpoint, SimdIter,
+        simd::{self},
+    },
     alloc::{string::String, vec::Vec},
     core::{
+        any::{Any, TypeId},
         cell::{Cell, Ref, RefCell, RefMut},
         fmt::Write,
         mem::transmute,
@@ -51,9 +55,19 @@ pub struct TextCmdData {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct StartClipData {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub enum DrawCmdData {
     Rect(RectCmdData),
     Text(TextCmdData),
+    StartClip(StartClipData),
+    EndClip,
 }
 
 #[derive(Default, Debug)]
@@ -197,9 +211,7 @@ impl<B: BackendBase> Backend for BackendFromBase<B> {
             let Some(ch) = text.next() else { break };
 
             if ch.is_whitespace() {
-                if ch == '\n' {
-                    break;
-                } else if cursor > width {
+                if cursor > width {
                     match last_word_chars {
                         Some(last_word_chars) => {
                             *text = last_word_chars;
@@ -207,6 +219,8 @@ impl<B: BackendBase> Backend for BackendFromBase<B> {
                         }
                         None => break,
                     }
+                } else if ch == '\n' {
+                    break;
                 } else {
                     last_word_chars = Some(text.clone());
                     last_word_end = cursor;
@@ -224,7 +238,7 @@ impl<B: BackendBase> Backend for BackendFromBase<B> {
 
 #[derive(Default, Debug)]
 pub struct Ctx {
-    frames: [RefCell<FrameCtx>; DIMS],
+    frames: [RefCell<FrameCtx>; 2],
     parent: Cell<ElemIdx>,
     current_elem: Cell<ElemIdx>,
     style: Cell<Style>,
@@ -236,14 +250,18 @@ pub struct Ctx {
 
 impl Ctx {
     pub fn format(&self, args: core::fmt::Arguments) -> TextId {
-        self.frame(0).text.format(args)
+        self.frame_mut(0).text.format(args)
     }
 
     pub fn text<'a>(&'a self, id: TextId) -> Ref<'a, str> {
         Ref::map(self.frames[1].borrow(), |v| v.text.get(id))
     }
 
-    pub fn frame<'b>(&'b self, offset: usize) -> RefMut<'b, FrameCtx> {
+    pub fn frame<'b>(&'b self, offset: usize) -> Ref<'b, FrameCtx> {
+        self.frames[offset].borrow()
+    }
+
+    pub fn frame_mut<'b>(&'b self, offset: usize) -> RefMut<'b, FrameCtx> {
         self.frames[offset].borrow_mut()
     }
 
@@ -271,19 +289,40 @@ impl Ctx {
         RefMut::map(self.frames[frame].borrow_mut(), |v| &mut v[id])
     }
 
+    pub fn elem_state<'b, T: Any>(
+        &'b self,
+        elem: ElemIdx,
+    ) -> Option<Ref<'b, T>> {
+        // SAFETY: we quarantee the `state_ref` is valid since user can not tamper with it and we
+        // clear the state along elements so it can't ever be stale
+        Ref::filter_map(self.frame(1), |f| unsafe {
+            f.state.get(f[elem].state, 1)
+        })
+        .ok()
+    }
+
     pub fn anon(&self) -> AnonElemBuilder<'_> {
         AnonElemBuilder(self.el(ElemID(0)))
     }
 
     /// If you don't need to access the builder during the styling, prefer `.anon()`
     pub fn el(&self, id: ElemID) -> ElemBuilder<'_> {
-        let mut frame = self.frame(0);
-        let idx = frame.add_elem(Elem {
+        let mut frame = self.frame_mut(0);
+        let elem = Elem {
             id,
             parent: self.parent.get(),
             style: self.style.get(),
+            clip_elem: if self.style.get().break_clip {
+                ElemIdx(0)
+            } else if frame[self.parent.get()].style.clip_overflow {
+                self.parent.get()
+            } else {
+                frame[self.parent.get()].clip_elem
+            },
+            state: frame.state.start_ref(),
             ..Default::default()
-        });
+        };
+        let idx = frame.add_elem(elem);
         frame[self.current_elem.get()].next = idx;
         self.current_elem.set(ElemIdx(0));
         self.parent.set(idx);
@@ -303,7 +342,7 @@ impl Ctx {
     pub fn cmds<'a>(
         &mut self,
         backend: &mut impl BackendBase,
-        scratch: &'a Checkpoint,
+        scratch: Option<&'a Checkpoint>,
         input_state: InputState,
     ) -> &'a mut [DrawCmd] {
         let arna = crate::Arna::scratch(scratch);
@@ -318,7 +357,7 @@ impl Ctx {
     pub fn cmds_ext<'a>(
         &mut self,
         backend: &mut dyn Backend,
-        scratch: &'a Checkpoint,
+        scratch: Option<&'a Checkpoint>,
         arna: &Checkpoint,
         input_state: InputState,
     ) -> &'a mut [DrawCmd] {
@@ -400,15 +439,19 @@ impl Ctx {
             cache: &mut MeasureCache,
             backend: &mut dyn Backend,
             root: ElemIdx,
-            max_width: f32,
+            mut max_width: f32,
         ) -> [f32; DIMS] {
-            let node = &ctx[root];
+            let r = &ctx[root];
+
+            if max_width == 0. {
+                max_width = r.inner_size(Dim::X)
+            }
 
             cache.get_or_insert(
-                node.style.text.len,
+                r.style.text.len,
                 MeasureCacheKey {
                     text_hash: extra[root].text_hash,
-                    elem_id: node.id,
+                    elem_id: r.id,
                     max_width,
                 },
                 &mut || {
@@ -482,8 +525,12 @@ impl Ctx {
         self.elem_index.clear();
         self.elem_index_ids.clear();
         self.frames.swap(0, 1);
-        self.frames[0].get_mut().elemets.truncate(1);
-        self.frames[0].get_mut().text.buf.clear();
+
+        let prev = self.frames[0].get_mut();
+        prev.elemets.truncate(1);
+        prev.text.buf.clear();
+        prev.state.mem.clear();
+        prev.state.last_off = 0;
 
         let ctx = self.frames[1].get_mut();
         let extra =
@@ -596,7 +643,7 @@ impl Ctx {
                         }
 
                         let mut process_line = iter.0 == 0;
-                        if !process_line {
+                        if !process_line && !ctx[root].style.dont_wrap {
                             process_line = line_x
                                 + ctx[root].style.gap
                                 + ctx[iter].outer_size(x)
@@ -666,8 +713,9 @@ impl Ctx {
                         max_x = f32::max(max_x, line_x);
                         line_y = f32::max(line_y, ctx[child].outer_size(y));
 
+                        // TODO: I dont like this duplication
                         let mut process_line = iter.0 == 0;
-                        if !process_line {
+                        if !process_line && !ctx[root].style.dont_wrap {
                             process_line = line_x
                                 + ctx[root].style.gap
                                 + ctx[iter].outer_size(x)
@@ -696,6 +744,11 @@ impl Ctx {
                             ctx[root].size[d] = f32::max(max, td)
                                 + ctx[root].style.padding[d].sum();
                         }
+
+                        ctx[root].content_size[d] = f32::max(
+                            ctx[root].content_size[d],
+                            td + ctx[root].style.padding[d].sum(),
+                        );
                     }
                 }
             }
@@ -710,21 +763,29 @@ impl Ctx {
 
                     let mut iter = ctx[root].first_child;
                     let mut cursor_x = 0.;
-                    let mut cursor_y = ctx[root].pos[y]
+                    let init_y = ctx[root].pos[y]
                         + ctx[root].style.align[y].offset(free_y)
-                        + ctx[root].style.padding[y].before;
+                        + ctx[root].style.padding[y].before
+                        - ctx[root].style.scroll[y];
+                    let mut cursor_y = init_y;
                     let mut y_size = 0.;
                     let mut last_line = u16::MAX;
                     let mut gap_x = 0.;
                     let mut gap_y = 0.;
                     while let Some(child) = iter.next(ctx) {
                         if extra[child].line != last_line {
+                            ctx[root].content_size[x] = f32::max(
+                                ctx[root].content_size[x],
+                                extra[child].used_x
+                                    + ctx[root].style.padding[x].sum(),
+                            );
                             cursor_x = ctx[root].pos[x]
                                 + ctx[root].style.align[x].offset(
                                     ctx[root].inner_size(x)
                                         - extra[child].used_x,
                                 )
-                                + ctx[root].style.padding[x].before;
+                                + ctx[root].style.padding[x].before
+                                - ctx[root].style.scroll[x];
                             cursor_y += gap_y + y_size;
                             gap_y = ctx[root].style.gap;
                             y_size = 0.;
@@ -754,6 +815,11 @@ impl Ctx {
                         cursor_x += gap_x + ctx[child].outer_size(x);
                         gap_x = ctx[root].style.gap;
                     }
+
+                    cursor_y += gap_y + y_size;
+
+                    ctx[root].content_size[y] =
+                        cursor_y - init_y + ctx[root].style.padding[y].sum();
                 }
             }
         });
@@ -766,71 +832,102 @@ impl Ctx {
 
         self.hovered.clear();
 
-        let mut buf = Vec::new_in(scratch);
-        for &n in &order {
-            let node = ctx[n];
+        if let Some(scratch) = scratch {
+            let mut buf = Vec::new_in(scratch);
+            let mut last_clip_elem = ElemIdx(0);
+            for &n in &order {
+                let node = ctx[n];
 
-            // NOTE: this will collect all overlaps, the last overlap has the highest
-            // priority since is't the top most element.
-            if [Dim::X, Dim::Y].into_iter().zip(input_state.mouse_pos).all(
-                |(d, m)| node.pos[d] <= m && m <= node.pos[d] + node.size[d],
-            ) {
-                self.hovered.push(n);
-            }
-
-            if node.style.bg_color != 0 {
-                buf.push(DrawCmd {
-                    elem: n,
-                    data: DrawCmdData::Rect(RectCmdData {
-                        x: node.pos.x,
-                        y: node.pos.y,
-                        width: node.size.x,
-                        height: node.size.y,
-                        color: node.style.bg_color,
-                    }),
-                });
-            }
-
-            if let Some((font, _)) = get_text_params(ctx, n) {
-                let [_, y] = measure_text!(ctx, n, 0.);
-
-                measure_text_ext(
-                    ctx,
-                    backend,
-                    n,
-                    0.,
-                    &mut |content, y_off, width| {
-                        // TODO: check bounds and skip this if possible
+                if node.clip_elem != last_clip_elem {
+                    if last_clip_elem.0 != 0 {
                         buf.push(DrawCmd {
-                            elem: n,
-                            data: DrawCmdData::Text(TextCmdData {
-                                x: node.pos.x
-                                    + node.style.padding.x.before
-                                    + node.style.align.x.offset(
-                                        node.inner_size(Dim::X) - width,
-                                    ),
-                                y: node.pos.y
-                                    + node.style.padding.y.before
-                                    + node
-                                        .style
-                                        .align
-                                        .y
-                                        .offset(node.inner_size(Dim::Y) - y)
-                                    + y_off,
-                                size: node.style.font_size,
-                                spacing: node.style.font_spacing,
-                                line_spacing: node.style.font_line_spacing,
-                                content,
-                                font,
-                                color: node.style.fg_color,
+                            elem: last_clip_elem,
+                            data: DrawCmdData::EndClip,
+                        });
+                    }
+
+                    if node.clip_elem.0 != 0 {
+                        let node = ctx[node.clip_elem];
+                        buf.push(DrawCmd {
+                            elem: node.clip_elem,
+                            data: DrawCmdData::StartClip(StartClipData {
+                                x: node.pos.x,
+                                y: node.pos.y,
+                                width: node.size.x,
+                                height: node.size.y,
                             }),
                         });
-                    },
-                );
-            }
-        }
+                    }
 
-        buf.leak()
+                    last_clip_elem = node.clip_elem;
+                }
+
+                // NOTE: this will collect all overlaps, the last overlap has the highest
+                // priority since is't the top most element.
+                if [Dim::X, Dim::Y].into_iter().zip(input_state.mouse_pos).all(
+                    |(d, m)| {
+                        node.pos[d] <= m && m <= node.pos[d] + node.size[d]
+                    },
+                ) && node.id.0 != 0
+                {
+                    self.hovered.push(n);
+                }
+
+                if node.style.bg_color != 0 {
+                    buf.push(DrawCmd {
+                        elem: n,
+                        data: DrawCmdData::Rect(RectCmdData {
+                            x: node.pos.x,
+                            y: node.pos.y,
+                            width: node.size.x,
+                            height: node.size.y,
+                            color: node.style.bg_color,
+                        }),
+                    });
+                }
+
+                if let Some((font, _)) = get_text_params(ctx, n) {
+                    let [_, y] = measure_text!(ctx, n, 0.);
+
+                    measure_text_ext(
+                        ctx,
+                        backend,
+                        n,
+                        0.,
+                        &mut |content, y_off, width| {
+                            // TODO: check bounds and skip this if possible
+                            buf.push(DrawCmd {
+                                elem: n,
+                                data: DrawCmdData::Text(TextCmdData {
+                                    x: node.pos.x
+                                        + node.style.padding.x.before
+                                        + node.style.align.x.offset(
+                                            node.inner_size(Dim::X) - width,
+                                        )
+                                        - node.style.scroll.x,
+                                    y: node.pos.y
+                                        + node.style.padding.y.before
+                                        + node.style.align.y.offset(
+                                            node.inner_size(Dim::Y) - y,
+                                        )
+                                        + y_off
+                                        - node.style.scroll.y,
+                                    size: node.style.font_size,
+                                    spacing: node.style.font_spacing,
+                                    line_spacing: node.style.font_line_spacing,
+                                    content,
+                                    font,
+                                    color: node.style.fg_color,
+                                }),
+                            });
+                        },
+                    );
+                }
+            }
+            buf.leak()
+        } else {
+            &mut []
+        }
     }
 }
 
@@ -897,7 +994,7 @@ impl MeasureCache {
         key: MeasureCacheKey,
         measure: &mut dyn FnMut() -> [f32; DIMS],
     ) -> [f32; DIMS] {
-        assert!(self.len < self.entries.len());
+        assert!(self.len <= self.entries.len());
 
         if len < Self::MIN_LEN_TO_CACHE {
             return measure();
@@ -960,6 +1057,7 @@ impl Default for MeasureCache {
 pub struct FrameCtx {
     elemets: Vec<Elem>,
     text: TextBuf,
+    state: StateHolder,
 }
 
 impl Default for FrameCtx {
@@ -967,6 +1065,7 @@ impl Default for FrameCtx {
         Self {
             elemets: alloc::vec![Default::default()],
             text: Default::default(),
+            state: Default::default(),
         }
     }
 }
@@ -1038,6 +1137,160 @@ impl FrameCtx {
     }
 }
 
+#[derive(Clone, Copy, Default, Debug)]
+pub struct StateRef {
+    firts_offet: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct StateHeader {
+    id: TypeId,
+    user_id: u32,
+    size: u32,
+}
+
+impl StateHeader {
+    pub fn from_u64(value: [u64; 3]) -> Self {
+        unsafe { core::mem::transmute(value) }
+    }
+
+    pub fn to_u64(self) -> [u64; 3] {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+
+#[derive(Debug)]
+pub struct StateHolder {
+    mem: Vec<u64>,
+    last_off: usize,
+}
+
+impl Default for StateHolder {
+    fn default() -> Self {
+        Self {
+            mem: Self::END_HEADER.to_u64().into(),
+            last_off: Default::default(),
+        }
+    }
+}
+
+pub struct Sentinel;
+
+impl StateHolder {
+    pub const ALIGNMENT: usize = core::mem::size_of::<u64>();
+    pub const HEADER_SPAN: usize =
+        core::mem::size_of::<StateHeader>() / Self::ALIGNMENT;
+    pub const END_ID: TypeId = core::any::TypeId::of::<Sentinel>();
+    pub const END_HEADER: StateHeader =
+        StateHeader { id: Self::END_ID, size: 0, user_id: 0 };
+
+    pub fn add_untyped<'a>(
+        &'a mut self,
+        id: TypeId,
+        user_id: u32,
+        data: &[u8],
+    ) -> &'a mut [u64] {
+        let size = ((data.len() + Self::ALIGNMENT - 1) / Self::ALIGNMENT)
+            .try_into()
+            .expect("data is too big");
+
+        self.last_off = self.mem.len();
+        self.mem.extend(StateHeader { id, size, user_id }.to_u64());
+
+        let (full_words, tail) = data.as_chunks::<{ Self::ALIGNMENT }>();
+        let mut tail_bytes = [0u8; Self::ALIGNMENT];
+        tail_bytes[..tail.len()].copy_from_slice(tail);
+
+        self.mem.extend(
+            full_words
+                .iter()
+                .copied()
+                .map(u64::from_le_bytes)
+                .chain(core::iter::once(u64::from_le_bytes(tail_bytes))),
+        );
+
+        &mut self.mem[self.last_off + Self::HEADER_SPAN..]
+    }
+
+    pub fn end_ref(&mut self) {
+        let header = StateHeader::from_u64(
+            *self.mem[self.last_off..][..Self::HEADER_SPAN]
+                .as_array()
+                .expect("we literraly sliced 3"),
+        );
+
+        if header.id != Self::END_ID {
+            self.mem.extend(Self::END_HEADER.to_u64());
+        }
+    }
+
+    pub fn start_ref(&self) -> StateRef {
+        StateRef { firts_offet: self.mem.len() as u32 }
+    }
+
+    pub fn get_untyped(
+        &self,
+        sref: StateRef,
+        id: TypeId,
+        user_id: u32,
+    ) -> Option<&[u64]> {
+        let mut cursor = sref.firts_offet as usize;
+        loop {
+            let header = StateHeader::from_u64(
+                *self.mem[cursor..][..Self::HEADER_SPAN]
+                    .as_array()
+                    .expect("we literraly sliced 3"),
+            );
+
+            if header.id == id && header.user_id == user_id {
+                return Some(
+                    &self.mem[cursor + Self::HEADER_SPAN..]
+                        [..header.size as usize],
+                );
+            }
+
+            if header.id == Self::END_ID {
+                return None;
+            }
+
+            cursor += Self::HEADER_SPAN + header.size as usize;
+        }
+    }
+
+    pub fn add<T: core::any::Any + Copy>(
+        &mut self,
+        id: u32,
+        value: T,
+    ) -> &mut T {
+        const { assert!(core::mem::align_of::<T>() <= Self::ALIGNMENT) }
+        unsafe {
+            &mut *self
+                .add_untyped(
+                    core::any::TypeId::of::<T>(),
+                    id,
+                    core::slice::from_raw_parts(
+                        &value as *const _ as *const _,
+                        core::mem::size_of::<T>(),
+                    ),
+                )
+                .as_mut_ptr()
+                .cast()
+        }
+    }
+
+    /// # Safety
+    ///
+    /// Caller must guarantee the `sref` is valid
+    pub unsafe fn get<T: core::any::Any>(
+        &self,
+        sref: StateRef,
+        id: u32,
+    ) -> Option<&T> {
+        let mem = self.get_untyped(sref, core::any::TypeId::of::<T>(), id)?;
+        Some(unsafe { &*mem.as_ptr().cast() })
+    }
+}
+
 /// .0 == 0 is reserved for anonimous elements
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
 pub struct ElemID(pub u32);
@@ -1089,12 +1342,26 @@ impl<'b> ElemBuilder<'b> {
         id
     }
 
-    pub fn prev(&self) -> Ref<'b, Elem> {
-        let id = self.id();
+    pub fn update_state<T: Any + Copy>(
+        &self,
+        update: impl FnOnce(Option<T>) -> T,
+    ) -> RefMut<'b, T> {
+        let idx = self.prev_idx();
+        let new = update(self.ctx.elem_state::<T>(idx).map(|v| *v));
+        RefMut::map(self.ctx.frame_mut(0), |s| s.state.add(1, new))
+    }
+
+    pub fn prev_idx(&self) -> ElemIdx {
         if self.prev_id.get().0 == 0 {
+            let id = self.id();
             self.prev_id.set(self.ctx.elem_idx_by_id(id));
         }
-        self.ctx.elem(1, self.prev_id.get())
+        self.prev_id.get()
+    }
+
+    pub fn prev(&self) -> Ref<'b, Elem> {
+        let idx = self.prev_idx();
+        self.ctx.elem(1, idx)
     }
 
     pub fn hovered(&self) -> bool {
@@ -1117,6 +1384,7 @@ impl<'b> ElemBuilder<'b> {
 
 impl Drop for ElemBuilder<'_> {
     fn drop(&mut self) {
+        self.ctx.frame_mut(0).state.end_ref();
         self.ctx.parent.set(self.ctx.elem_mut(0, self.idx).parent);
         let mut parent = self.ctx.elem_mut(0, self.ctx.parent.get());
         if parent.first_child.0 == 0 {
@@ -1132,20 +1400,28 @@ pub struct Elem {
     parent: ElemIdx,
     first_child: ElemIdx,
     next: ElemIdx,
+    // private due to safety concerns
+    state: StateRef,
+    clip_elem: ElemIdx,
 
     pub style: Style,
 
     pub pos: Dims<f32>,
     pub size: Dims<f32>,
+    pub content_size: Dims<f32>,
 }
 
 impl Elem {
-    pub fn inner_size(&self, dim: Dim) -> f32 {
-        self.size[dim] - self.style.padding[dim].sum()
+    pub fn scroll_allowance(&self, d: Dim) -> f32 {
+        (self.content_size[d] - self.size[d]).max(0.)
     }
 
-    pub fn outer_size(&self, dim: Dim) -> f32 {
-        self.size[dim] + self.style.margin[dim].sum()
+    pub fn inner_size(&self, d: Dim) -> f32 {
+        self.size[d] - self.style.padding[d].sum()
+    }
+
+    pub fn outer_size(&self, d: Dim) -> f32 {
+        self.size[d] + self.style.margin[d].sum()
     }
 }
 
@@ -1359,6 +1635,9 @@ derive_style_builder! {
         pub font_spacing: f32,
         pub font_line_spacing: f32,
         pub layer: u32,
+        pub dont_wrap: bool,
+        pub clip_overflow: bool,
+        pub break_clip: bool,
     }
 }
 
@@ -1427,9 +1706,9 @@ pub const fn lerp_color(a: Color, b: Color, t: f32) -> Color {
     let mut i = 0;
     while i < 4 {
         let shift = i * 8;
-        let a = ((a >> shift) & 0xff) as f32;
-        let b = ((b >> shift) & 0xff) as f32;
-        let v = lerp(a, b, t);
+        let a = ((a >> shift) & 0xff) as f32 / 255.0;
+        let b = ((b >> shift) & 0xff) as f32 / 255.0;
+        let v = lerp_tol(a, b, t, 0.) * 255.0;
 
         out |= (v as u32) << shift;
         i += 1;
@@ -1438,12 +1717,16 @@ pub const fn lerp_color(a: Color, b: Color, t: f32) -> Color {
     out
 }
 
-pub const fn lerp(a: f32, b: f32, t: f32) -> f32 {
-    if (a - b).abs() <= 1. {
+pub const fn lerp_tol(a: f32, b: f32, t: f32, tol: f32) -> f32 {
+    if (a - b).abs() <= tol {
         return b;
     }
 
     a + (b - a) * t
+}
+
+pub const fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    lerp_tol(a, b, t, 1.)
 }
 
 pub const fn fnv1a(bytes: &[u8]) -> u32 {

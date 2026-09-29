@@ -2,11 +2,12 @@ use {
     arna::{
         Arna, aformat,
         dynlib::hot::Module,
-        id,
+        hot_api, id,
         imui::{
-            Align, BLUE, BackendBase, Color, Ctx, Direction::Top2Bottom,
-            DrawCmdData, FontId, GREEN, Glyph, InputState, Layout::Flex, RED,
-            RectCmdData, TextCmdData, WHITE, lerp, lerp_color,
+            Align, BLUE, BackendBase, Color, Ctx, Dim, Direction::Top2Bottom,
+            DrawCmdData, ElemBuilder, FontId, GREEN, Glyph, InputState,
+            Layout::Flex, RED, RectCmdData, StartClipData, TextCmdData, WHITE,
+            lerp, lerp_color,
         },
     },
     core::{
@@ -31,23 +32,23 @@ unsafe extern "C" {
     #[link_name = "SetTargetFPS"]
     pub fn set_target_fps(flags: i32);
     #[link_name = "InitWindow"]
-    fn init_window(width: i32, height: i32, name: *const c_char);
+    pub fn init_window(width: i32, height: i32, name: *const c_char);
     #[link_name = "WindowShouldClose"]
-    fn window_should_close() -> bool;
+    pub fn window_should_close() -> bool;
     #[link_name = "BeginDrawing"]
-    fn begin_drawing();
+    pub fn begin_drawing();
     #[link_name = "ClearBackground"]
-    fn clear_background(color: RaylibColor);
+    pub fn clear_background(color: RaylibColor);
     #[link_name = "EndDrawing"]
-    fn end_drawing();
+    pub fn end_drawing();
     #[link_name = "CloseWindow"]
-    fn close_window();
+    pub fn close_window();
     #[link_name = "DrawRectangleRec"]
-    fn draw_rectangle(rec: RaylibRectangle, color: RaylibColor);
+    pub fn draw_rectangle(rec: RaylibRectangle, color: RaylibColor);
     #[link_name = "GetMousePosition"]
-    fn get_mouse_position() -> [f32; 2];
+    pub fn get_mouse_position() -> [f32; 2];
     #[link_name = "IsMouseButtonPressed"]
-    fn is_mouse_button_pressed(button: MouseButton) -> bool;
+    pub fn is_mouse_button_pressed(button: MouseButton) -> bool;
     #[link_name = "GetScreenWidth"]
     pub fn get_screen_width() -> i32;
     #[link_name = "GetScreenHeight"]
@@ -63,6 +64,12 @@ unsafe extern "C" {
         rotation: f32,
         tint: RaylibColor,
     );
+    #[link_name = "GetMouseWheelMoveV"]
+    pub fn get_mouse_wheel_move() -> [f32; 2];
+    #[link_name = "BeginScissorMode"]
+    pub fn begin_scissor_mode(x: i32, y: i32, width: i32, height: i32);
+    #[link_name = "EndScissorMode"]
+    pub fn end_scissor_mode();
 }
 
 pub struct IndexedFont {
@@ -100,14 +107,6 @@ impl App {
             backend: RaylibBackend,
         }
     }
-}
-
-fn init_temp_arenas() {
-    Arna::init_temp_arenas(array::from_fn(|_| {
-        Arna::from(
-            vec![MaybeUninit::<u8>::uninit(); 1024 * 1024].into_boxed_slice(),
-        )
-    }));
 }
 
 pub fn draw_text_ex(
@@ -295,24 +294,22 @@ impl BackendBase for RaylibBackend {
     }
 }
 
-#[unsafe(no_mangle)]
-extern "C" fn create() -> *mut c_void {
-    Box::into_raw(Box::new(App::new())).cast()
-}
+hot_api! {
+    impl Hot for App {
+        fn destroy() -> Self;
 
-#[unsafe(no_mangle)]
-unsafe extern "C" fn destroy(state: *mut c_void) {
-    drop(unsafe { Box::from_raw(state.cast::<App>()) });
-}
+        fn create() -> Self {
+            App::new()
+        }
 
-#[unsafe(no_mangle)]
-extern "C" fn state_version() -> usize {
-    1
-}
+        fn state_version() -> usize {
+            1
+        }
 
-#[unsafe(no_mangle)]
-unsafe extern "C" fn run(state: *mut c_void) {
-    render(unsafe { &mut *state.cast::<App>() });
+        fn run(slf: &mut Self) {
+            render(slf);
+        }
+    }
 }
 
 fn render(app: &mut App) {
@@ -329,25 +326,77 @@ fn render(app: &mut App) {
                 .font_line_spacing(2.)
         });
 
-        let _el = ctx.anon().style(|s| {
+        fn update_scroll(b: &ElemBuilder, d: Dim) -> f32 {
+            #[derive(Clone, Copy, Debug)]
+            struct State {
+                target: f32,
+            }
+
+            let movement = unsafe { get_mouse_wheel_move()[d as usize] * 50. };
+
+            let mut should_move = false;
+
+            for el in b.ctx.hovered.iter().copied().rev() {
+                let elem = b.ctx.elem(1, el);
+                let scroll_allowance = elem.scroll_allowance(d);
+                let mut can_move = scroll_allowance != 0.
+                    && b.ctx.elem_state::<State>(el).is_some();
+                can_move &= (elem.style.scroll[d] != 0.
+                    && elem.style.scroll[d] != scroll_allowance)
+                    || (elem.style.scroll[d] == 0. && movement < 0.)
+                    || (elem.style.scroll[d] == scroll_allowance
+                        && movement > 0.);
+
+                if can_move {
+                    if el == b.idx && movement != 0. {
+                        should_move = true;
+                        break;
+                    }
+
+                    break;
+                }
+            }
+
+            let p = b.prev();
+            let scroll_allowance = p.scroll_allowance(d);
+            let state = b.update_state(|s: Option<State>| {
+                let mut current = s.unwrap_or(State { target: 0. });
+                if should_move {
+                    current.target -= movement;
+                }
+                current.target =
+                    f32::clamp(current.target, 0., scroll_allowance);
+                current
+            });
+
+            lerp(p.style.scroll.y, state.target, 0.2)
+        }
+
+        let _el = ctx.el(id!()).style(|b, s| {
             s.width(unsafe { get_screen_width() } as f32)
                 .height(unsafe { get_screen_height() } as f32)
+                .scroll_y(update_scroll(&b, Dim::Y))
                 .layout(Flex)
-                .align_y(Align::Center)
+                .dont_wrap(true)
+                //.align_y(Align::Center)
                 .direction(Top2Bottom)
-            //.text(include_str!("raylib.rs"))
+            //.text(&include_str!("raylib.rs")[..1000 * 3 - 4])
         });
 
-        if true {
-            let _wrap = ctx.anon().style(|s| {
+        for i in 0..3 {
+            let _wrap = ctx.el(id!("", i)).style(|b, s| {
                 s.width_perc(1.)
+                    .width(300.)
+                    .height(300.)
                     .bg_color(BLUE)
                     .align_x(Align::Center)
+                    .scroll_y(update_scroll(&b, Dim::Y))
+                    .clip_overflow(true)
                     .gap(10.)
                     .gap(0.)
             });
 
-            for _ in 0..300 {
+            for _ in 0..5000 {
                 ctx.anon().style(|s| s.width(1.).bg_color(RED));
             }
 
@@ -472,9 +521,10 @@ fn render(app: &mut App) {
 
     for cmd in app.ctx.cmds(
         &mut app.backend,
-        &cmds,
+        Some(&cmds),
         InputState { mouse_pos: unsafe { get_mouse_position() } },
     ) {
+        break;
         match cmd.data {
             DrawCmdData::Text(TextCmdData {
                 x,
@@ -502,6 +552,15 @@ fn render(app: &mut App) {
                     conv_color(color),
                 );
             },
+            DrawCmdData::StartClip(StartClipData { x, y, width, height }) => unsafe {
+                begin_scissor_mode(
+                    x as i32,
+                    y as i32,
+                    width as i32,
+                    height as i32,
+                );
+            },
+            DrawCmdData::EndClip => unsafe { end_scissor_mode() },
         }
     }
 
@@ -518,9 +577,13 @@ fn render(app: &mut App) {
 pub fn main() {
     unsafe { set_config_flags(FLAG_WINDOW_RESIZABLE) };
     unsafe { init_window(800, 600, c"Arna IMUI example".as_ptr()) };
-    unsafe { set_target_fps(60) };
+    unsafe { set_target_fps(120) };
 
-    init_temp_arenas();
+    Arna::init_temp_arenas(array::from_fn(|_| {
+        Arna::from(
+            vec![MaybeUninit::<u8>::uninit(); 1024 * 1024].into_boxed_slice(),
+        )
+    }));
 
     let mut app = App::new();
     let mut module = Module::new(
@@ -537,10 +600,10 @@ pub fn main() {
     );
 
     while !unsafe { window_should_close() } {
-        unsafe { begin_drawing() };
-        unsafe {
-            clear_background(RaylibColor { r: 30, g: 35, b: 45, a: 255 })
-        };
+        //unsafe { begin_drawing() };
+        //unsafe {
+        //    clear_background(RaylibColor { r: 30, g: 35, b: 45, a: 255 })
+        //};
 
         if cfg!(debug_assertions) {
             unsafe { module.reload_if_changed() };
@@ -549,7 +612,7 @@ pub fn main() {
             render(&mut app);
         }
 
-        unsafe { end_drawing() };
+        //unsafe { end_drawing() };
     }
 
     unsafe { close_window() };

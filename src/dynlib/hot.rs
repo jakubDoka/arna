@@ -4,92 +4,67 @@ use {
     core::ffi::c_void,
     std::{
         collections::BTreeSet,
-        ffi::OsString,
-        fmt, fs, io, mem,
+        ffi::{OsStr, OsString},
+        fs, io, mem,
         path::{Path, PathBuf},
-        process::{Command, ExitStatus, Stdio},
+        process::Command,
         sync::atomic::{AtomicPtr, Ordering},
         time::SystemTime,
     },
 };
 
+/// Small utility to quickly export the hot reloaded object api
+#[macro_export]
+macro_rules! hot_api {
+    // TODO: maybe generate helpers for making the module that creates this
+    (
+        impl Hot for $ty:ty {
+            fn $drop:ident() -> Self;
+
+            fn $create:ident() -> Self {
+                $($create_compute:tt)*
+            }
+
+            fn $version:ident() -> usize {
+                $($version_compute:tt)*
+            }
+
+            $(
+                fn $fn_name:ident($slf:ident: &mut Self) {
+                    $($fn_compute:tt)*
+                }
+            )*
+        }
+    ) => {
+        #[unsafe(no_mangle)]
+        extern "C" fn $create() -> *mut c_void {
+            Box::into_raw(Box::new($($create_compute)*)).cast()
+        }
+
+        #[unsafe(no_mangle)]
+        unsafe extern "C" fn $drop(state: *mut c_void) {
+            drop(unsafe { Box::from_raw(state.cast::<$ty>()) });
+        }
+
+        #[unsafe(no_mangle)]
+        extern "C" fn $version() -> usize {
+            $($version_compute)*
+        }
+
+        $(
+            #[unsafe(no_mangle)]
+            unsafe extern "C" fn $fn_name(state: *mut c_void) {
+                let $slf = unsafe { &mut *state.cast::<$ty>() };
+                $($fn_compute)*
+            }
+        )*
+    };
+}
+
 type Constructor = unsafe extern "C" fn() -> *mut c_void;
 type Destructor = unsafe extern "C" fn(*mut c_void);
 type StateVersion = unsafe extern "C" fn() -> usize;
 type StateFunction = unsafe extern "C" fn(*mut c_void);
-
-#[derive(Debug)]
-pub enum Error {
-    MissingSymbolName(&'static str),
-    InvalidSymbolName,
-    UnsupportedCargoArguments(&'static str),
-    Cargo(io::Error),
-    CargoFailed(ExitStatus),
-    ArtifactNotFound,
-    MultipleArtifacts(Vec<PathBuf>),
-    DependencyFileNotFound(PathBuf),
-    Io(io::Error),
-    DynamicLibrary(String),
-    Symbol { name: String, error: String },
-    NotLoaded,
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MissingSymbolName(kind) => {
-                write!(f, "the {kind} symbol name was not configured")
-            }
-            Self::InvalidSymbolName => {
-                write!(f, "symbol names cannot contain NUL bytes")
-            }
-            Self::UnsupportedCargoArguments(argument) => write!(
-                f,
-                "the hot module controls `{argument}` and it cannot be passed in the Cargo arguments"
-            ),
-            Self::Cargo(error) => write!(f, "failed to run Cargo: {error}"),
-            Self::CargoFailed(status) => {
-                write!(f, "Cargo failed with {status}")
-            }
-            Self::ArtifactNotFound => {
-                write!(f, "Cargo did not produce a cdylib artifact")
-            }
-            Self::MultipleArtifacts(paths) => write!(
-                f,
-                "Cargo produced multiple cdylib artifacts: {}",
-                paths
-                    .iter()
-                    .map(|path| path.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-            Self::DependencyFileNotFound(path) => write!(
-                f,
-                "Cargo did not produce the expected dependency file `{}`",
-                path.display()
-            ),
-            Self::Io(error) => error.fmt(f),
-            Self::DynamicLibrary(error) => {
-                write!(f, "failed to load dynamic library: {error}")
-            }
-            Self::Symbol { name, error } => {
-                write!(f, "failed to load symbol `{name}`: {error}")
-            }
-            Self::NotLoaded => {
-                write!(f, "the hot module has not been loaded yet")
-            }
-        }
-    }
-}
-
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Cargo(error) | Self::Io(error) => Some(error),
-            _ => None,
-        }
-    }
-}
 
 struct State {
     pointer: *mut c_void,
@@ -137,27 +112,8 @@ impl Module {
         }
     }
 
-    /// Builds and reloads the module if one of its Cargo inputs changed.
-    ///
-    /// Returns `true` when a new dynamic library was loaded. This is the only
-    /// operation that checks the watched files or invokes Cargo.
-    ///
-    /// # Safety
-    ///
-    /// The configured symbols must have the following ABIs:
-    ///
-    /// - constructor: `unsafe extern "C" fn() -> *mut c_void`
-    /// - destructor: `unsafe extern "C" fn(*mut c_void)`
-    /// - state version: `unsafe extern "C" fn() -> usize`
-    ///
-    /// If the library exports Arna's `ARNA_TEMP_ARENAS_OVERRIDE`, it must be
-    /// the `AtomicPtr<TempArenas>` provided by Arna's `dll` feature.
-    ///
-    /// A state version must only be reused when functions in the newly built
-    /// library can safely operate on state created by an older library with
-    /// that version. None of the functions may unwind across the ABI boundary.
     pub unsafe fn reload_if_changed(&mut self) {
-        pub unsafe fn perform(slf: &mut Module) -> Result<(), Error> {
+        pub unsafe fn perform(slf: &mut Module) -> Result<(), String> {
             let latest = slf
                 .watched_files
                 .iter()
@@ -177,7 +133,8 @@ impl Module {
 
             let artifact = slf.build_artifact()?;
             let hot_path = slf.hot_path(&artifact.library)?;
-            fs::copy(&artifact.library, &hot_path).map_err(Error::Io)?;
+            fs::copy(&artifact.library, &hot_path)
+                .map_err(|error| error.to_string())?;
 
             let loaded = match slf.load(&hot_path, &artifact) {
                 Ok(loaded) => loaded,
@@ -189,9 +146,6 @@ impl Module {
 
             let version = unsafe { (loaded.state_version)() };
             if slf.state.as_ref().map(|state| state.version) != Some(version) {
-                if let Some(state) = slf.state.take() {
-                    unsafe { (state.destructor)(state.pointer) };
-                }
                 slf.state = Some(State {
                     pointer: unsafe { (loaded.constructor)() },
                     destructor: loaded.destructor,
@@ -213,101 +167,50 @@ impl Module {
         }
     }
 
-    /// Calls `unsafe extern "C" fn(*mut c_void)` from the current library.
-    ///
-    /// # Safety
-    ///
-    /// `name` must identify a function with that exact ABI, and the function
-    /// must accept the state created by the configured constructor. It must not
-    /// retain the pointer beyond the call or unwind across the ABI boundary.
-    pub unsafe fn call(&mut self, name: &str) -> Result<(), Error> {
+    pub unsafe fn call(&mut self, name: &str) -> Result<(), String> {
         if name.as_bytes().contains(&0) {
-            return Err(Error::InvalidSymbolName);
+            return Err("symbol names cannot contain NUL bytes".to_owned());
         }
 
         let library = self
             .current_library
             .and_then(|index| self.libraries.get(index))
-            .ok_or(Error::NotLoaded)?;
-        let state = self.state.as_mut().ok_or(Error::NotLoaded)?;
-        let pointer = unsafe { library.symbol::<c_void>(name) }
-            .map_err(|error| Error::Symbol { name: name.to_owned(), error })?;
+            .ok_or_else(|| {
+                "the hot module has not been loaded yet".to_owned()
+            })?;
+        let state = self.state.as_mut().ok_or_else(|| {
+            "the hot module has not been loaded yet".to_owned()
+        })?;
+        let pointer =
+            unsafe { library.symbol::<c_void>(name) }.map_err(|error| {
+                format!("failed to load symbol `{name}`: {error}")
+            })?;
         let function =
             unsafe { mem::transmute::<*mut c_void, StateFunction>(pointer) };
         unsafe { function(state.pointer) };
         Ok(())
     }
 
-    fn build_artifact(&self) -> Result<Artifact, Error> {
-        let mut command = Command::new("cargo");
-        if let Some(separator) =
-            self.cargo_args.iter().position(|argument| argument == "--")
-        {
-            command
-                .args(&self.cargo_args[..separator])
-                .arg("--message-format=json-render-diagnostics")
-                .args(&self.cargo_args[separator..]);
-        } else {
-            command
-                .args(&self.cargo_args)
-                .arg("--message-format=json-render-diagnostics");
-        }
-        let output =
-            command.stderr(Stdio::inherit()).output().map_err(Error::Cargo)?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut artifacts = BTreeSet::new();
-        for line in stdout.lines() {
-            if line.contains("\"reason\":\"compiler-message\"")
-                && let Some(rendered) = json_string_field(line, "rendered")
-            {
-                eprint!("{rendered}");
-            }
-
-            if !line.contains("\"reason\":\"compiler-artifact\"")
-                || !json_array_contains(line, "crate_types", "cdylib")
-            {
-                continue;
-            }
-
-            let Some(library) = json_string_array(line, "filenames")
-                .into_iter()
-                .map(PathBuf::from)
-                .find(|path| {
-                    path.to_string_lossy()
-                        .ends_with(std::env::consts::DLL_SUFFIX)
-                })
-            else {
-                continue;
-            };
-            let manifest =
-                json_string_field(line, "manifest_path").map(PathBuf::from);
-            artifacts.insert((library, manifest));
+    fn build_artifact(&self) -> Result<Artifact, String> {
+        let artifact = artifact_from_cargo_args(&self.cargo_args)?;
+        let status = Command::new("cargo")
+            .args(&self.cargo_args)
+            .status()
+            .map_err(|error| format!("failed to run Cargo: {error}"))?;
+        if !status.success() {
+            return Err(format!("Cargo failed with {status}"));
         }
 
-        if !output.status.success() {
-            return Err(Error::CargoFailed(output.status));
-        }
-
-        match artifacts.len() {
-            0 => Err(Error::ArtifactNotFound),
-            1 => {
-                let (library, manifest) = artifacts.into_iter().next().unwrap();
-                Ok(Artifact { library, manifest })
-            }
-            _ => Err(Error::MultipleArtifacts(
-                artifacts.into_iter().map(|(path, _)| path).collect(),
-            )),
-        }
+        Ok(artifact)
     }
 
-    fn hot_path(&mut self, artifact: &Path) -> Result<PathBuf, Error> {
-        let stem = artifact.file_stem().ok_or_else(|| {
-            Error::Io(io::Error::other("cdylib artifact has no file stem"))
-        })?;
-        let extension = artifact.extension().ok_or_else(|| {
-            Error::Io(io::Error::other("cdylib artifact has no extension"))
-        })?;
+    fn hot_path(&mut self, artifact: &Path) -> Result<PathBuf, String> {
+        let stem = artifact
+            .file_stem()
+            .ok_or_else(|| "cdylib artifact has no file stem".to_owned())?;
+        let extension = artifact
+            .extension()
+            .ok_or_else(|| "cdylib artifact has no extension".to_owned())?;
         let path = artifact.with_file_name(format!(
             "{}.hot-{}-{}.{}",
             stem.to_string_lossy(),
@@ -319,9 +222,10 @@ impl Module {
         Ok(path)
     }
 
-    fn load(&self, path: &Path, artifact: &Artifact) -> Result<Loaded, Error> {
-        let library =
-            DynamicLibrary::open(Some(path)).map_err(Error::DynamicLibrary)?;
+    fn load(&self, path: &Path, artifact: &Artifact) -> Result<Loaded, String> {
+        let library = DynamicLibrary::open(Some(path)).map_err(|error| {
+            format!("failed to load dynamic library: {error}")
+        })?;
         unsafe { connect_temp_arenas(&library) };
         let constructor =
             unsafe { self.symbol::<Constructor>(&library, &self.constructor)? };
@@ -345,9 +249,11 @@ impl Module {
         &self,
         library: &DynamicLibrary,
         name: &str,
-    ) -> Result<T, Error> {
-        let pointer = unsafe { library.symbol::<c_void>(name) }
-            .map_err(|error| Error::Symbol { name: name.to_owned(), error })?;
+    ) -> Result<T, String> {
+        let pointer =
+            unsafe { library.symbol::<c_void>(name) }.map_err(|error| {
+                format!("failed to load symbol `{name}`: {error}")
+            })?;
         debug_assert_eq!(mem::size_of::<T>(), mem::size_of_val(&pointer));
         Ok(unsafe { mem::transmute_copy(&pointer) })
     }
@@ -368,11 +274,15 @@ unsafe fn connect_temp_arenas(library: &DynamicLibrary) {
     );
 }
 
+impl Drop for State {
+    fn drop(&mut self) {
+        unsafe { (self.destructor)(self.pointer) };
+    }
+}
+
 impl Drop for Module {
     fn drop(&mut self) {
-        if let Some(state) = self.state.take() {
-            unsafe { (state.destructor)(state.pointer) };
-        }
+        self.state.take();
         self.libraries.clear();
         for path in &self.library_paths {
             let _ = fs::remove_file(path);
@@ -382,7 +292,7 @@ impl Drop for Module {
 
 struct Artifact {
     library: PathBuf,
-    manifest: Option<PathBuf>,
+    dependency_file: PathBuf,
 }
 
 struct Loaded {
@@ -393,222 +303,71 @@ struct Loaded {
     watched_files: BTreeSet<PathBuf>,
 }
 
-fn watched_files(artifact: &Artifact) -> Result<BTreeSet<PathBuf>, Error> {
-    let dependency_file = artifact.library.with_extension("d");
-    let contents = fs::read_to_string(&dependency_file).map_err(|error| {
-        if error.kind() == io::ErrorKind::NotFound {
-            Error::DependencyFileNotFound(dependency_file.clone())
-        } else {
-            Error::Io(error)
-        }
-    })?;
-    let base = std::env::current_dir().map_err(Error::Io)?;
-    let mut files = parse_dependency_file(&contents)
+fn watched_files(artifact: &Artifact) -> Result<BTreeSet<PathBuf>, String> {
+    let contents =
+        fs::read_to_string(&artifact.dependency_file).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                format!(
+                    "Cargo did not produce the expected dependency file `{}`",
+                    artifact.dependency_file.display()
+                )
+            } else {
+                error.to_string()
+            }
+        })?;
+    let base = std::env::current_dir().map_err(|error| error.to_string())?;
+    let files = parse_dependency_file(&contents)
         .into_iter()
         .map(|path| if path.is_absolute() { path } else { base.join(path) })
         .collect::<BTreeSet<_>>();
-
-    if let Some(manifest) = &artifact.manifest {
-        files.insert(manifest.clone());
-        if let Some(lock) = manifest.parent().and_then(|directory| {
-            directory
-                .ancestors()
-                .map(|path| path.join("Cargo.lock"))
-                .find(|path| path.is_file())
-        }) {
-            files.insert(lock);
-        }
-    }
-
     Ok(files)
 }
 
-fn parse_dependency_file(contents: &str) -> Vec<PathBuf> {
-    let Some(mut index) = contents
-        .as_bytes()
-        .windows(2)
-        .position(|pair| pair[0] == b':' && pair[1].is_ascii_whitespace())
-        .map(|index| index + 2)
-    else {
-        return Vec::new();
-    };
+fn artifact_from_cargo_args(args: &[OsString]) -> Result<Artifact, String> {
+    let example = cargo_argument(args, "--example")
+        .ok_or_else(|| {
+            "the Cargo arguments must include `--example <name>`".to_owned()
+        })?
+        .to_string_lossy()
+        .replace('-', "_");
+    let profile =
+        if cargo_flag(args, "--release") { "release" } else { "debug" };
+    let directory = Path::new("target").join(profile).join("examples");
+    let stem = format!("{}{example}", std::env::consts::DLL_PREFIX);
 
-    let bytes = contents.as_bytes();
-    let mut paths = Vec::new();
-    let mut path = Vec::new();
-    while index < bytes.len() {
-        match bytes[index] {
-            b'\\'
-                if bytes.get(index + 1) == Some(&b'\r')
-                    && bytes.get(index + 2) == Some(&b'\n') =>
-            {
-                index += 3
-            }
-            b'\\' if bytes.get(index + 1) == Some(&b'\n') => index += 2,
-            b'\\' if index + 1 < bytes.len() => {
-                path.push(bytes[index + 1]);
-                index += 2;
-            }
-            byte if byte.is_ascii_whitespace() => {
-                if !path.is_empty() {
-                    paths.push(PathBuf::from(
-                        String::from_utf8_lossy(&path).into_owned(),
-                    ));
-                    path.clear();
-                }
-                index += 1;
-            }
-            byte => {
-                path.push(byte);
-                index += 1;
-            }
+    Ok(Artifact {
+        library: directory
+            .join(format!("{stem}{}", std::env::consts::DLL_SUFFIX)),
+        dependency_file: directory.join(format!("{stem}.d")),
+    })
+}
+
+fn cargo_argument<'a>(args: &'a [OsString], name: &str) -> Option<&'a OsStr> {
+    let mut args = args.iter().map(OsString::as_os_str);
+    while let Some(argument) = args.next() {
+        if argument == "--" {
+            break;
         }
-    }
-    if !path.is_empty() {
-        paths.push(PathBuf::from(String::from_utf8_lossy(&path).into_owned()));
-    }
-    paths
-}
-
-fn json_array_contains(input: &str, field: &str, expected: &str) -> bool {
-    json_string_array(input, field).iter().any(|value| value == expected)
-}
-
-fn json_string_array(input: &str, field: &str) -> Vec<String> {
-    let Some(mut index) = json_field_value(input, field) else {
-        return Vec::new();
-    };
-    let bytes = input.as_bytes();
-    if bytes.get(index) != Some(&b'[') {
-        return Vec::new();
-    }
-    index += 1;
-
-    let mut values = Vec::new();
-    while index < bytes.len() {
-        skip_json_whitespace(bytes, &mut index);
-        match bytes.get(index) {
-            Some(b']') | None => break,
-            Some(b'"') => {
-                if let Some(value) = parse_json_string(input, &mut index) {
-                    values.push(value);
-                } else {
-                    break;
-                }
-            }
-            _ => break,
+        if argument == name {
+            return args.next();
         }
-        skip_json_whitespace(bytes, &mut index);
-        if bytes.get(index) == Some(&b',') {
-            index += 1;
-        }
-    }
-    values
-}
-
-fn json_string_field(input: &str, field: &str) -> Option<String> {
-    let mut index = json_field_value(input, field)?;
-    parse_json_string(input, &mut index)
-}
-
-fn json_field_value(input: &str, field: &str) -> Option<usize> {
-    let needle = format!("\"{field}\"");
-    let bytes = input.as_bytes();
-    let mut index = input.find(&needle)? + needle.len();
-    skip_json_whitespace(bytes, &mut index);
-    if bytes.get(index) != Some(&b':') {
-        return None;
-    }
-    index += 1;
-    skip_json_whitespace(bytes, &mut index);
-    Some(index)
-}
-
-fn skip_json_whitespace(bytes: &[u8], index: &mut usize) {
-    while bytes.get(*index).is_some_and(u8::is_ascii_whitespace) {
-        *index += 1;
-    }
-}
-
-fn parse_json_string(input: &str, index: &mut usize) -> Option<String> {
-    let bytes = input.as_bytes();
-    if bytes.get(*index) != Some(&b'"') {
-        return None;
-    }
-    *index += 1;
-    let mut value = String::new();
-    let mut plain_start = *index;
-
-    while *index < bytes.len() {
-        match bytes[*index] {
-            b'"' => {
-                value.push_str(input.get(plain_start..*index)?);
-                *index += 1;
-                return Some(value);
-            }
-            b'\\' => {
-                value.push_str(input.get(plain_start..*index)?);
-                *index += 1;
-                let escaped = *bytes.get(*index)?;
-                *index += 1;
-                match escaped {
-                    b'"' => value.push('"'),
-                    b'\\' => value.push('\\'),
-                    b'/' => value.push('/'),
-                    b'b' => value.push('\u{8}'),
-                    b'f' => value.push('\u{c}'),
-                    b'n' => value.push('\n'),
-                    b'r' => value.push('\r'),
-                    b't' => value.push('\t'),
-                    b'u' => {
-                        let hex = input.get(*index..*index + 4)?;
-                        let code = u32::from_str_radix(hex, 16).ok()?;
-                        value.push(char::from_u32(code)?);
-                        *index += 4;
-                    }
-                    _ => return None,
-                }
-                plain_start = *index;
-            }
-            _ => *index += 1,
+        if let Some(value) = argument
+            .to_str()
+            .and_then(|argument| argument.strip_prefix(name))
+            .and_then(|argument| argument.strip_prefix('='))
+        {
+            return Some(OsStr::new(value));
         }
     }
     None
 }
 
-#[cfg(test)]
-mod tests {
-    use {
-        super::{json_string_array, json_string_field, parse_dependency_file},
-        std::path::PathBuf,
-    };
+fn cargo_flag(args: &[OsString], name: &str) -> bool {
+    args.iter()
+        .take_while(|argument| argument.as_os_str() != "--")
+        .any(|argument| argument == name)
+}
 
-    #[test]
-    fn parses_cargo_json_strings() {
-        let json = r#"{"manifest_path":"C:\\work\\Cargo.toml","filenames":["/tmp/lib one.so","/tmp/lib.rlib"]}"#;
-        assert_eq!(
-            json_string_field(json, "manifest_path").unwrap(),
-            "C:\\work\\Cargo.toml"
-        );
-        assert_eq!(
-            json_string_array(json, "filenames"),
-            ["/tmp/lib one.so", "/tmp/lib.rlib"]
-        );
-    }
-
-    #[test]
-    fn parses_escaped_dependency_paths() {
-        let paths = parse_dependency_file(
-            "target/lib.so: src/lib.rs path\\ with\\ spaces.rs \\\r\nsrc/other.rs \\\nsrc/final.rs\n",
-        );
-        assert_eq!(
-            paths,
-            [
-                PathBuf::from("src/lib.rs"),
-                PathBuf::from("path with spaces.rs"),
-                PathBuf::from("src/other.rs"),
-                PathBuf::from("src/final.rs"),
-            ]
-        );
-    }
+fn parse_dependency_file(contents: &str) -> Vec<PathBuf> {
+    contents.split_whitespace().skip(1).map(|s| PathBuf::from(s)).collect()
 }

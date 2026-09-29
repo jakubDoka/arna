@@ -435,6 +435,15 @@ impl<'a> Arna<'a> {
     }
 }
 
+impl<T: IntoClobber> IntoClobber for Option<T> {
+    fn address(self) -> *const () {
+        match self {
+            Some(v) => v.address(),
+            None => null(),
+        }
+    }
+}
+
 pub trait IntoClobber {
     fn address(self) -> *const ();
 }
