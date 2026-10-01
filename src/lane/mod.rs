@@ -312,6 +312,119 @@ pub unsafe fn create_shared<'a, S>(
 /// # Safety
 ///
 /// Caller must guarantee the `checkpoint` is dropped after `to_drop`
+pub unsafe fn batch_detached_<
+    'a,
+    BC: Any + FnOnce(&'a Checkpoint) -> B,
+    B: Send + Sync,
+    SC: Any + FnOnce(&'a Checkpoint) -> S,
+    S: Send + Sync,
+    PC: Any + FnOnce(&'a Checkpoint) -> &'a mut [P],
+    P: Send + Sync,
+>(
+    checkpoint: &'a Checkpoint,
+    to_drop: &Cell<Erased>,
+    partition: PC,
+    state: SC,
+    broadcast: BC,
+) -> (&'a [B], &'a S, &'a mut [P]) {
+    with_local(|local| {
+        let part;
+        let state_ptr;
+        let broad;
+        if local.index == 0 {
+            part = unsafe {
+                create_shared(checkpoint, to_drop, partition(checkpoint))
+            };
+            unsafe {
+                *local.global.broadcast_ptrs[0].get() = BroadcastPtr {
+                    ptr: &part as *const _ as *const _,
+                    id: TypeId::of::<PC>(),
+                }
+            }
+
+            state_ptr = unsafe {
+                create_shared(checkpoint, to_drop, state(checkpoint))
+            };
+
+            unsafe {
+                *local.global.broadcast_ptrs[1].get() = BroadcastPtr {
+                    ptr: &state_ptr as *const _ as *const _,
+                    id: TypeId::of::<SC>(),
+                };
+            }
+
+            broad = checkpoint.alloc_uninit::<B>(local.global.count);
+            unsafe {
+                *local.global.broadcast_ptrs[2].get() = BroadcastPtr {
+                    ptr: &broad as *const _ as *const _,
+                    id: TypeId::of::<BC>(),
+                };
+            }
+        }
+
+        local.global.share_barier.wait();
+
+        let part = unsafe {
+            (*local.global.broadcast_ptrs[0].get())
+                .downcast::<PC, *mut [P]>()
+                .ok_or("partition")?
+        };
+
+        let state = unsafe {
+            (*local.global.broadcast_ptrs[1].get())
+                .downcast::<SC, &S>()
+                .ok_or("state")?
+        };
+
+        let broad = unsafe {
+            (*local.global.broadcast_ptrs[2].get())
+                .downcast::<BC, *mut [B]>()
+                .ok_or("broadcast")?
+        };
+        unsafe {
+            (broad as *mut B).add(local.index).write(broadcast(checkpoint))
+        };
+
+        // NOTE: some threads can panic on broadcast so we taks every thread with freeing its
+        // part, if they reach the drop they reach this, the slot is initialized
+        unsafe {
+            if core::mem::needs_drop::<B>() {
+                struct Dropper<B>(*mut B);
+
+                impl<B> Drop for Dropper<B> {
+                    fn drop(&mut self) {
+                        unsafe {
+                            core::ptr::drop_in_place(self.0);
+                        }
+                    }
+                }
+
+                create_shared(
+                    checkpoint,
+                    to_drop,
+                    Dropper((broad as *mut B).add(local.index)),
+                );
+            }
+        }
+
+        local.global.share_barier.wait();
+
+        let range =
+            task_slice_bounds(part.len(), local.global.count, local.index);
+
+        Ok::<_, &'static str>((unsafe { &*broad }, state, unsafe {
+            core::slice::from_raw_parts_mut(
+                (part as *mut P).add(range.start),
+                range.len(),
+            )
+        }))
+    })
+    .expect("type mismatch")
+}
+
+/// # Safety
+///
+/// Caller must guarantee the `checkpoint` is dropped after `to_drop`
 pub unsafe fn batch_detached<
     'a,
     B: Sync + Send + Any,
@@ -470,8 +583,9 @@ impl Drop for Scope<'_> {
 #[cfg(test)]
 mod test {
     use {
-        crate::{Arna, lane},
+        crate::{Arna, Checkpoint, lane},
         core::{
+            any::Any,
             iter,
             sync::atomic::{AtomicUsize, Ordering},
         },
