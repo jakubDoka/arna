@@ -5,6 +5,7 @@ use {
         any::{Any, TypeId},
         cell::{Cell, RefCell, UnsafeCell},
         ops::{Deref, Range},
+        ptr::NonNull,
     },
     std::sync::Barrier,
 };
@@ -33,7 +34,6 @@ impl Default for BroadcastPtr {
 pub struct GlobalState {
     broadcast_ptrs: [UnsafeCell<BroadcastPtr>; 3],
     share_barier: Barrier,
-    sync_barier: Barrier,
     count: usize,
 }
 
@@ -42,7 +42,6 @@ impl GlobalState {
         Self {
             broadcast_ptrs: Default::default(),
             share_barier: Barrier::new(count),
-            sync_barier: Barrier::new(count),
             count,
         }
     }
@@ -111,8 +110,10 @@ impl Drop for Erased {
 pub struct Scope<'b> {
     to_drop: Cell<Erased>,
     checkpoint: Checkpoint<'b>,
+    // Allocated on checkpoint
+    sync_barier: NonNull<Barrier>,
     prev_local: Option<LocalState>,
-    pub group: usize,
+    pub group: u8,
 }
 
 impl<'b> Deref for Scope<'b> {
@@ -160,7 +161,7 @@ pub fn scope(checkpoint: Checkpoint) -> Scope {
 
 pub fn scope_group_with(
     checkpoint: Checkpoint,
-    mut partitioner: impl FnMut(usize) -> usize,
+    mut partitioner: impl FnMut(u8) -> u8,
 ) -> Scope {
     let scratch = Arna::scratch(&checkpoint);
     let mut i = 0;
@@ -173,25 +174,37 @@ pub fn scope_group_with(
 
 pub fn scope_with_group_projection<'a>(
     checkpoint: Checkpoint<'a>,
-    group_projection: Option<&[usize]>,
+    group_projection: Option<&[u8]>,
 ) -> Scope<'a> {
+    // NOTE: outside code can not reproduce the call here, they dont have access to the
+    // type id of this type so they can't call the broadcast to smuggle out the state we
+    // have here
+    struct TamperMarker;
+
+    #[derive(Clone)]
+    struct Smuggle(NonNull<Barrier>);
+
+    unsafe impl Send for Smuggle {}
+    unsafe impl Sync for Smuggle {}
+
     unsafe fn perform<'a, 'b>(
         checkpoint: &'a Checkpoint,
         to_drop: &Cell<Erased>,
-        groups: &[usize],
-    ) -> (usize, LocalState) {
+        groups: &[u8],
+    ) -> (u8, LocalState, NonNull<Barrier>) {
         let index = index();
 
         let current = groups[index];
         let index = groups[..index].iter().filter(|&&v| v == current).count();
 
-        println!("{:?}", groups);
+        let mut pattern = [0u8; 256];
+        pattern[..groups.len()].copy_from_slice(groups);
 
-        let shared = unsafe {
+        let (broad, shared, _) = unsafe {
             batch_detached(
                 checkpoint,
                 to_drop,
-                (),
+                pattern,
                 || {
                     let group_count = groups
                         .iter()
@@ -200,51 +213,77 @@ pub fn scope_with_group_projection<'a>(
                         .expect("we absolutely have at least one lane")
                         + 1;
 
-                    let thread_counts =
-                        checkpoint.alloc_default::<usize>(group_count).unwrap();
+                    let thread_counts = checkpoint
+                        .alloc_default::<u8>(group_count as usize)
+                        .unwrap();
                     for &group in groups {
-                        thread_counts[group] += 1;
+                        thread_counts[group as usize] += 1;
                     }
-
-                    println!("{:?}", thread_counts);
 
                     let slots = thread_counts
                         .iter()
-                        .map(|&count| Arc::new(GlobalState::new(count)))
+                        .map(|&count| {
+                            (
+                                Arc::new(GlobalState::new(count as usize)),
+                                Smuggle(NonNull::from_ref(
+                                    checkpoint
+                                        .create(Barrier::new(count as usize)),
+                                )),
+                            )
+                        })
                         .collect::<Vec<_>>();
 
                     create_shared(checkpoint, to_drop, slots).as_slice()
                 },
-                (),
-                |_| -> &mut [()] { &mut [] },
+                TamperMarker,
+                |_| -> &mut [TamperMarker] { &mut [] },
             )
-            .1
         };
 
-        let global = shared[current].clone();
+        let (global, Smuggle(barrier)) = shared[current as usize].clone();
+
+        if !broad.iter().all(|&v| v == broad[index]) {
+            // NOTE: this is required and also sound since we just successfully broadcasted
+            // with a private type
+            with_local(|l| l.global.share_barier.wait());
+            panic!("projection mismatch");
+        }
 
         (
             current,
-            with_local(|l| {
-                l.global.sync_barier.wait();
-                let vl = core::mem::replace(l, LocalState { global, index });
-                l.global.sync_barier.wait();
-                vl
-            }),
+            with_local(|l| core::mem::replace(l, LocalState { global, index })),
+            barrier,
         )
     }
 
     let mut prev_local = None;
     let mut group = 0;
+    let bariera;
     let to_drop = Default::default();
     if let Some(group_projection) = group_projection {
-        let (new_group, new_prev_local) =
+        let (new_group, new_prev_local, barier) =
             unsafe { perform(&checkpoint, &to_drop, group_projection) };
         group = new_group;
         prev_local = Some(new_prev_local);
+        bariera = barier;
+    } else {
+        let count = count();
+        bariera = unsafe {
+            NonNull::from_ref(
+                batch_detached(
+                    &checkpoint,
+                    &to_drop,
+                    (),
+                    || checkpoint.create(Barrier::new(count)),
+                    TamperMarker,
+                    |_| -> &mut [TamperMarker] { &mut [] },
+                )
+                .1,
+            )
+        }
     }
 
-    Scope { checkpoint, to_drop, prev_local, group }
+    Scope { checkpoint, to_drop, prev_local, group, sync_barier: bariera }
 }
 
 pub unsafe fn create_shared<'a, S>(
@@ -414,7 +453,7 @@ impl<'b> Scope<'b> {
     }
 
     pub fn sync(&self) {
-        with_local(|l| l.global.sync_barier.wait());
+        unsafe { self.sync_barier.as_ref().wait() };
     }
 }
 
@@ -463,9 +502,42 @@ mod test {
                 assert_eq!(accum2.load(Ordering::Relaxed), 1024);
 
                 {
+                    enum GroupKind {
+                        Eaven(usize),
+                        Odd(usize),
+                    }
+
                     let scratch = Arna::scratch(&*scope);
                     let split_scope =
                         lane::scope_group_with(scratch, |i| i % 2);
+
+                    let slice = scope.partition(vec![], |vck| {
+                        vck.extend(iter::repeat_n(1, 1024));
+                        &mut vck[..]
+                    });
+
+                    let sum = slice.iter().sum::<usize>();
+
+                    let kind = match split_scope.group == 0 {
+                        true => GroupKind::Eaven(sum),
+                        false => GroupKind::Odd(sum),
+                    };
+
+                    drop(split_scope);
+
+                    let slots = scope.broadcast(kind);
+
+                    let [mut eaven, mut odd] = [0; 2];
+
+                    for slot in slots {
+                        match slot {
+                            GroupKind::Eaven(e) => eaven += e,
+                            GroupKind::Odd(o) => odd += o,
+                        }
+                    }
+
+                    assert_eq!(eaven, 1024);
+                    assert_eq!(odd, 1024);
                 }
             }
         });
@@ -541,6 +613,71 @@ mod test {
         });
     }
 
+    /// UB vector #4: divergent group projections create multiple "leaders".
+    ///
+    /// `scope_with_group_projection` trusts each lane's own slice: group
+    /// assignment and intra-group rank come from the *local* lane's
+    /// projection, while the `GlobalState`s (and their barrier counts) are
+    /// built from *lane 0's* projection. With divergent projections, lanes
+    /// 1 and 2 land in a group whose barrier has count 1 (i.e. no
+    /// synchronization at all) while holding ranks 1 and 2. They then either
+    /// read the never-written default `BroadcastPtr` (whose `()` TypeId
+    /// passes the `P = ()` downcast and whose null pointer is dereferenced),
+    /// race lane 0's slot writes, and/or write past the 1-element broadcast
+    /// buffer with their out-of-range ranks.
+    #[ignore = "demonstrates UB (null deref / data race / OOB write): cargo miri test -- --ignored unsound_divergent_group_projection"]
+    #[test]
+    pub fn unsound_divergent_group_projection() {
+        lane::launch(3, || {
+            Arna::init_temp_arenas_with_boxes(1024 * 2);
+            let proj: &[u8] =
+                if lane::index() == 0 { &[0, 1, 1] } else { &[0, 0, 0] };
+            let scope =
+                lane::scope_with_group_projection(Arna::scratch(0), Some(proj));
+            scope.broadcast(1u8);
+        });
+    }
+
+    /// UB vector #5: lifetime confinement breach via type-matched slots.
+    ///
+    /// `scope_group_with`'s internal `perform` publishes its freshly created
+    /// `Vec<Arc<GlobalState>>` through the *parent* broadcast slots with
+    /// `S = [Arc<GlobalState>]`, `B = P = ()`. Another lane can match all
+    /// three slot types with `share_with` (its closure never runs — only
+    /// lane 0 executes the publishing side of a batch) and thereby obtain a
+    /// `&[Arc<GlobalState>]` pointing into a `Vec` owned by *lane 0's group
+    /// scope*. Lane 0 then drops that scope, freeing the `Vec`'s heap
+    /// buffer, while lane 1's reference (tied to *its own* still-alive
+    /// scope) remains valid per the type system — a use-after-free.
+    #[ignore = "demonstrates UB (use-after-free): cargo miri test -- --ignored unsound_cross_scope_lifetime_escape"]
+    #[test]
+    pub fn unsound_cross_scope_lifetime_escape() {
+        use alloc::sync::Arc;
+        lane::launch(2, || {
+            Arna::init_temp_arenas_with_boxes(1024 * 4);
+            let scope = lane::scope(Arna::scratch(0));
+            if lane::index() == 0 {
+                let group =
+                    lane::scope_group_with(Arna::scratch(&*scope), |i| i);
+                drop(group);
+                scope.sync();
+            } else {
+                let stolen: &[Arc<lane::GlobalState>] = scope
+                    .batch(
+                        [0u8; 256],
+                        || -> &[Arc<lane::GlobalState>] { &[] },
+                        (), // no longer possible
+                        |_| -> &mut [()] { &mut [] },
+                    )
+                    .1;
+                scope.sync();
+                scope.sync();
+                scope.sync();
+                let _clone = stolen[0].clone();
+            }
+        });
+    }
+
     #[ignore = "this will deadlock"]
     #[test]
     pub fn melacious() {
@@ -563,6 +700,31 @@ mod test {
                 });
 
                 slice.fill(10);
+            }
+        });
+    }
+
+    #[ignore = "this will deadlock"]
+    #[test]
+    pub fn unsound_scope_drop_order() {
+        lane::launch(16, || {
+            Arna::init_temp_arenas_with_boxes(128 * 2);
+
+            let scope = lane::scope(Arna::scratch(0));
+            let scope2 = lane::scope(Arna::scratch(&*scope));
+
+            let slice = scope2.partition(vec![], |vck| {
+                vck.extend(iter::repeat_n(1usize, 1024));
+                &mut vck[..]
+            });
+
+            if lane::index() == 0 {
+                drop(scope2);
+                drop(scope);
+            } else {
+                drop(scope);
+                slice.fill(2);
+                drop(scope2);
             }
         });
     }
