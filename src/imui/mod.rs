@@ -9,7 +9,7 @@ use {
         cell::{Cell, Ref, RefCell, RefMut},
         fmt::Write,
         mem::transmute,
-        ops::{Index, IndexMut},
+        ops::{Add, Index, IndexMut, Range},
         ptr::{NonNull, null},
         slice,
     },
@@ -21,10 +21,17 @@ pub const DIMS: usize = 2;
 #[macro_export]
 macro_rules! id {
     () => { const { id!(file!(), line!(), column!()) } };
+
+    (# $($idx:expr),*) => {
+        const { id!(file!(), line!(), column!()) }
+            $(.idx($idx as usize))*
+    };
+
     ($expr:expr $(, $idx:expr)*) => {
         const { $crate::imui::ElemID($crate::imui::fnv1a(str::as_bytes($expr)))
              } $(.idx($idx as usize))*
     };
+
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -46,6 +53,8 @@ pub struct RectCmdData {
 pub struct TextCmdData {
     pub x: f32,
     pub y: f32,
+    pub width: f32,
+    pub height: f32,
     pub size: f32,
     pub spacing: f32,
     pub line_spacing: f32,
@@ -99,6 +108,7 @@ impl TextBuf {
     }
 }
 
+// TODO: also add mode where we store the string inline
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
 pub struct TextId {
     ptr: *const u8,
@@ -140,6 +150,7 @@ impl TextId {
 #[derive(Default, Debug, Clone, Copy)]
 pub struct InputState {
     pub mouse_pos: [f32; DIMS],
+    pub selection: [[f32; DIMS]; 2],
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -178,8 +189,41 @@ pub trait Backend {
         text: &mut core::str::Chars,
         font_size: f32,
         spacing: f32,
+        at_whitespace: bool,
         width: f32,
     ) -> f32;
+
+    fn measure_text(
+        &mut self,
+        font: FontId,
+        text: &str,
+        font_size: f32,
+        spacing: f32,
+    ) -> f32 {
+        self.find_line_boundary(
+            font,
+            &mut text.chars(),
+            font_size,
+            spacing,
+            false,
+            f32::MAX,
+        )
+    }
+
+    fn find_position_index(
+        &mut self,
+        font: FontId,
+        text: &str,
+        font_size: f32,
+        spacing: f32,
+        pos: f32,
+    ) -> usize {
+        let mut chars = text.chars();
+        self.find_line_boundary(
+            font, &mut chars, font_size, spacing, false, pos,
+        );
+        text.len() - chars.as_str().len() - 1
+    }
 }
 
 /// NOTE: this is to allow the compiler to optimize the insides of these functions to the
@@ -200,6 +244,7 @@ impl<B: BackendBase> Backend for BackendFromBase<B> {
         text: &mut core::str::Chars,
         font_size: f32,
         spacing: f32,
+        at_whitespace: bool,
         width: f32,
     ) -> f32 {
         let mut cursor = 0.;
@@ -210,7 +255,7 @@ impl<B: BackendBase> Backend for BackendFromBase<B> {
         loop {
             let Some(ch) = text.next() else { break };
 
-            if ch.is_whitespace() {
+            if ch.is_whitespace() || !at_whitespace {
                 if cursor > width {
                     match last_word_chars {
                         Some(last_word_chars) => {
@@ -299,6 +344,16 @@ impl Ctx {
             f.state.get(f[elem].state, 1)
         })
         .ok()
+    }
+
+    pub fn elem_state_mut<'b, T: Any>(
+        &'b mut self,
+        elem: ElemIdx,
+    ) -> Option<&'b mut T> {
+        // SAFETY: we quarantee the `state_ref` is valid since user can not tamper with it and we
+        // clear the state along elements so it can't ever be stale
+        let f = self.frames[1].get_mut();
+        unsafe { f.state.get_mut(f[elem].state, 1) }
     }
 
     pub fn anon(&self) -> AnonElemBuilder<'_> {
@@ -447,6 +502,10 @@ impl Ctx {
                 max_width = r.inner_size(Dim::X)
             }
 
+            if r.style.dont_wrap_text {
+                max_width = f32::MAX;
+            }
+
             cache.get_or_insert(
                 r.style.text.len,
                 MeasureCacheKey {
@@ -471,12 +530,16 @@ impl Ctx {
             backend: &mut dyn Backend,
             root: ElemIdx,
             mut max_width: f32,
-            with_chunk: &mut dyn FnMut(TextId, f32, f32),
+            with_chunk: &mut dyn FnMut(TextId, f32, [f32; DIMS]),
         ) -> [f32; DIMS] {
             let r = &ctx[root];
 
             if max_width == 0. {
                 max_width = r.inner_size(Dim::X)
+            }
+
+            if r.style.dont_wrap_text {
+                max_width = f32::MAX;
             }
 
             if let Some((font, full_text)) = get_text_params(ctx, root) {
@@ -494,6 +557,7 @@ impl Ctx {
                         &mut text,
                         r.style.font_size,
                         r.style.font_spacing,
+                        true,
                         max_width,
                     );
                     width = line_width.max(width);
@@ -507,7 +571,7 @@ impl Ctx {
                             full_text.len() - curr_len,
                         ),
                         height,
-                        line_width,
+                        [line_width, line_height],
                     );
 
                     height += line_spacing + line_height;
@@ -633,7 +697,7 @@ impl Ctx {
 
                         line_x += gap_x + ctx[child].outer_size(x);
                         gap_x = ctx[root].style.gap;
-                        let mut free_space = ctx[root].inner_size(x) - line_x;
+                        let free_space = ctx[root].inner_size(x) - line_x;
 
                         extra[child].line = line;
 
@@ -653,18 +717,28 @@ impl Ctx {
                         if process_line {
                             line += 1;
 
+                            let mut free_space = ctx[root].inner_size(x);
+
                             let mut total_perc = 0.;
 
                             let mut line_iter = line_first;
+                            let mut line_gap_x = 0.;
                             while let Some(line_child) = line_iter.next(ctx)
                                 && line_child != iter
                             {
                                 if let Size::Perc(p) =
                                     ctx[line_child].style.size[x].to_size()
                                 {
-                                    free_space += ctx[line_child].inner_size(x);
+                                    free_space -=
+                                        ctx[line_child].style.margin[x].sum()
+                                            + ctx[line_child].style.padding[x]
+                                                .sum();
                                     total_perc += p;
+                                } else {
+                                    free_space -= ctx[line_child].outer_size(x);
                                 }
+                                free_space -= line_gap_x;
+                                line_gap_x = ctx[root].style.gap;
                             }
 
                             total_perc = total_perc.max(1.);
@@ -677,7 +751,7 @@ impl Ctx {
                                     ctx[line_child].style.size[x].to_size()
                                 {
                                     ctx[line_child].size[x] = f32::max(
-                                        ctx[line_child].size[x],
+                                        ctx[line_child].style.min_size[x],
                                         free_space * (p / total_perc)
                                             + ctx[line_child].style.padding[x]
                                                 .sum(),
@@ -833,7 +907,14 @@ impl Ctx {
         self.hovered.clear();
 
         if let Some(scratch) = scratch {
+            let s = input_state.selection;
+            let s = [
+                [s[0][0].min(s[1][0]), s[0][1].min(s[1][1])],
+                [s[0][0].max(s[1][0]), s[0][1].max(s[1][1])],
+            ];
+
             let mut buf = Vec::new_in(scratch);
+
             let mut last_clip_elem = ElemIdx(0);
             for &n in &order {
                 let node = ctx[n];
@@ -847,14 +928,31 @@ impl Ctx {
                     }
 
                     if node.clip_elem.0 != 0 {
-                        let node = ctx[node.clip_elem];
+                        let mut top_left = Dims { x: f32::MIN, y: f32::MIN };
+                        let mut bottom_right =
+                            Dims { x: f32::MAX, y: f32::MAX };
+
+                        // NOTE: clip is self referential so we need to check parent
+                        let mut cursor = node.clip_elem;
+                        while cursor.0 != 0 {
+                            let node = ctx[cursor];
+                            let br = node.pos + node.size;
+
+                            top_left.x = f32::max(top_left.x, node.pos.x);
+                            top_left.y = f32::max(top_left.y, node.pos.y);
+                            bottom_right.x = f32::min(bottom_right.x, br.x);
+                            bottom_right.y = f32::min(bottom_right.y, br.y);
+
+                            cursor = ctx[node.parent].clip_elem;
+                        }
+
                         buf.push(DrawCmd {
                             elem: node.clip_elem,
                             data: DrawCmdData::StartClip(StartClipData {
-                                x: node.pos.x,
-                                y: node.pos.y,
-                                width: node.size.x,
-                                height: node.size.y,
+                                x: top_left.x,
+                                y: top_left.y,
+                                width: bottom_right.x - top_left.x,
+                                height: bottom_right.y - top_left.y,
                             }),
                         });
                     }
@@ -894,17 +992,20 @@ impl Ctx {
                         backend,
                         n,
                         0.,
-                        &mut |content, y_off, width| {
+                        &mut |content, y_off, [width, height]| {
+                            let x =
+                                node.pos.x
+                                    + node.style.padding.x.before
+                                    + node.style.align.x.offset(
+                                        node.inner_size(Dim::X) - width,
+                                    )
+                                    - node.style.scroll.x;
+
                             // TODO: check bounds and skip this if possible
                             buf.push(DrawCmd {
                                 elem: n,
                                 data: DrawCmdData::Text(TextCmdData {
-                                    x: node.pos.x
-                                        + node.style.padding.x.before
-                                        + node.style.align.x.offset(
-                                            node.inner_size(Dim::X) - width,
-                                        )
-                                        - node.style.scroll.x,
+                                    x,
                                     y: node.pos.y
                                         + node.style.padding.y.before
                                         + node.style.align.y.offset(
@@ -912,6 +1013,8 @@ impl Ctx {
                                         )
                                         + y_off
                                         - node.style.scroll.y,
+                                    width,
+                                    height,
                                     size: node.style.font_size,
                                     spacing: node.style.font_spacing,
                                     line_spacing: node.style.font_line_spacing,
@@ -924,6 +1027,24 @@ impl Ctx {
                     );
                 }
             }
+
+            if last_clip_elem.0 != 0 {
+                buf.push(DrawCmd {
+                    elem: last_clip_elem,
+                    data: DrawCmdData::EndClip,
+                });
+            }
+
+            buf.push(DrawCmd {
+                elem: ElemIdx(0),
+                data: DrawCmdData::Rect(RectCmdData {
+                    x: s[0][0],
+                    y: s[0][1],
+                    width: s[1][0] - s[0][0],
+                    height: s[1][1] - s[0][1],
+                    color: 0x0000ff55,
+                }),
+            });
 
             buf.leak()
         } else {
@@ -1234,7 +1355,7 @@ impl StateHolder {
         sref: StateRef,
         id: TypeId,
         user_id: u32,
-    ) -> Option<&[u64]> {
+    ) -> Option<Range<usize>> {
         let mut cursor = sref.firts_offet as usize;
         loop {
             let header = StateHeader::from_u64(
@@ -1245,8 +1366,8 @@ impl StateHolder {
 
             if header.id == id && header.user_id == user_id {
                 return Some(
-                    &self.mem[cursor + Self::HEADER_SPAN..]
-                        [..header.size as usize],
+                    cursor + Self::HEADER_SPAN
+                        ..cursor + Self::HEADER_SPAN + header.size as usize,
                 );
             }
 
@@ -1288,7 +1409,19 @@ impl StateHolder {
         id: u32,
     ) -> Option<&T> {
         let mem = self.get_untyped(sref, core::any::TypeId::of::<T>(), id)?;
-        Some(unsafe { &*mem.as_ptr().cast() })
+        Some(unsafe { &*self.mem[mem.start..].as_ptr().cast() })
+    }
+
+    /// # Safety
+    ///
+    /// Caller must guarantee the `sref` is valid
+    pub unsafe fn get_mut<T: core::any::Any>(
+        &mut self,
+        sref: StateRef,
+        id: u32,
+    ) -> Option<&mut T> {
+        let mem = self.get_untyped(sref, core::any::TypeId::of::<T>(), id)?;
+        Some(unsafe { &mut *self.mem[mem.start..].as_mut_ptr().cast() })
     }
 }
 
@@ -1386,7 +1519,13 @@ impl<'b> ElemBuilder<'b> {
 impl Drop for ElemBuilder<'_> {
     fn drop(&mut self) {
         self.ctx.frame_mut(0).state.end_ref();
-        self.ctx.parent.set(self.ctx.elem_mut(0, self.idx).parent);
+        {
+            let mut elem = self.ctx.elem_mut(0, self.idx);
+            self.ctx.parent.set(elem.parent);
+            if elem.style.clip_overflow {
+                elem.clip_elem = self.idx;
+            }
+        }
         let mut parent = self.ctx.elem_mut(0, self.ctx.parent.get());
         if parent.first_child.0 == 0 {
             parent.first_child = self.idx;
@@ -1541,6 +1680,14 @@ impl<T> IndexMut<Dim> for Dims<T> {
     }
 }
 
+impl<T: Add<Output = T>> Add for Dims<T> {
+    type Output = Dims<T>;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        Dims { x: self.x + rhs.x, y: self.y + rhs.y }
+    }
+}
+
 pub trait TrueDims {
     type Elem;
 }
@@ -1606,6 +1753,7 @@ macro_rules! derive_style_builder {
 }
 
 derive_style_builder! {
+    // NOTE: interning this does not help
     #[derive(Clone, Copy, Default, Debug)]
     pub struct Style {
         #[set(align_x, align_y)]
@@ -1639,6 +1787,7 @@ derive_style_builder! {
         pub dont_wrap: bool,
         pub clip_overflow: bool,
         pub break_clip: bool,
+        pub dont_wrap_text: bool,
     }
 }
 
@@ -1690,6 +1839,11 @@ impl Style {
 
     pub fn height_grow(mut self) -> Self {
         self.size.y = -1.;
+        self
+    }
+
+    pub fn mutate(mut self, mutator: impl FnOnce(&mut Self)) -> Self {
+        mutator(&mut self);
         self
     }
 }

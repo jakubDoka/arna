@@ -18,6 +18,8 @@ use core::{
 pub mod dynlib;
 #[cfg(feature = "alloc")]
 pub mod imui;
+#[cfg(feature = "std")]
+pub mod lane;
 
 pub mod simd {
     pub fn align_forward(len: usize) -> usize {
@@ -77,7 +79,7 @@ extern crate alloc;
 pub struct Checkpoint<'a> {
     arna: NonNull<Arna<'a>>,
     prev_pos: usize,
-    depth: usize,
+    depth: u32,
 }
 
 impl<'a> Checkpoint<'a> {
@@ -191,8 +193,16 @@ impl<'a> Checkpoint<'a> {
         &'b self,
         len: usize,
     ) -> OwnedSlice<'b, T> {
+        self.alloc_with(len, T::default)
+    }
+
+    pub fn alloc_with<'b, T>(
+        &'b self,
+        len: usize,
+        mut with: impl FnMut() -> T,
+    ) -> OwnedSlice<'b, T> {
         let alloc = self.alloc_uninit(len);
-        alloc.fill_with(|| MaybeUninit::new(T::default()));
+        alloc.fill_with(|| MaybeUninit::new(with()));
         unsafe { OwnedSlice::from_slice(alloc.assume_init_mut()) }
     }
 
@@ -296,7 +306,8 @@ pub struct Arna<'a> {
     commited: Cell<usize>,
     ptr: *mut u8,
     cap: usize,
-    depth: Cell<usize>,
+    depth: Cell<u32>,
+    is_thread_local: bool,
 
     borrow: PhantomData<&'a mut [u8]>,
     _unpin: PhantomPinned,
@@ -363,6 +374,17 @@ impl<'a> Arna<'a> {
         // SAFETY: the drop of the previous arenas will panic if any checkpoints are still
         // active
         TEMP_ARENAS.with(|old_slots| unsafe { *old_slots.get() = slots })
+    }
+
+    #[cfg(feature = "std")]
+    pub fn init_temp_arenas_with_boxes(cap: usize) {
+        Self::init_temp_arenas(core::array::from_fn(|_| {
+            let mut arna = Arna::from(
+                vec![MaybeUninit::<u8>::uninit(); cap].into_boxed_slice(),
+            );
+            arna.is_thread_local = true;
+            arna
+        }));
     }
 
     #[cfg(feature = "virtual")]
@@ -553,6 +575,7 @@ impl Arna<'static> {
             }),
             pos: 0.into(),
             depth: 0.into(),
+            is_thread_local: false,
             borrow: PhantomData,
             _unpin: PhantomPinned,
         }
@@ -562,7 +585,7 @@ impl Arna<'static> {
 impl Drop for Arna<'_> {
     fn drop(&mut self) {
         assert!(
-            panicking() || self.depth.get() == 0,
+            panicking() || self.depth.get() == 0 || self.is_thread_local,
             "all checkpoins need to be dropped"
         );
         let _mem = slice_from_raw_parts_mut(self.ptr, self.cap);
@@ -747,12 +770,7 @@ pub mod tests {
     #[cfg(feature = "alloc")]
     #[test]
     fn temp_arenas() {
-        use core::mem::MaybeUninit;
-
-        Arna::init_temp_arenas([
-            Arna::from(Box::from_iter([MaybeUninit::<u8>::uninit(); 1024])),
-            Arna::from(Box::from_iter([MaybeUninit::<u8>::uninit(); 1024])),
-        ]);
+        Arna::init_temp_arenas_with_boxes(1024);
 
         {
             let check = Arna::scratch(0);
