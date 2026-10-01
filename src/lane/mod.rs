@@ -1,14 +1,16 @@
 use {
-    crate::{Arna, Checkpoint},
+    crate::{Arna, Checkpoint, lane::barrier::Usage},
     alloc::sync::Arc,
+    barrier::Barrier,
     core::{
         any::{Any, TypeId},
         cell::{Cell, RefCell, UnsafeCell},
         ops::{Deref, Range},
-        ptr::NonNull,
     },
-    std::sync::Barrier,
+    std::sync::Mutex,
 };
+
+pub mod barrier;
 
 pub struct BroadcastPtr {
     ptr: *const (),
@@ -107,20 +109,197 @@ impl Drop for Erased {
     }
 }
 
-pub struct Scope<'b> {
+pub const BARRIER_PURPOSE_DROP: u64 = 1;
+pub const BARRIER_PURPOSE_SYNC: u64 = 2;
+
+pub struct ScopeMemory<'b> {
     to_drop: Cell<Erased>,
     checkpoint: Checkpoint<'b>,
-    // Allocated on checkpoint
-    sync_barier: NonNull<Barrier>,
+}
+
+impl<'b> ScopeMemory<'b> {
+    /// # Safety
+    ///
+    /// Caller must guarantee the `checkpoint` is dropped after `to_drop`
+    pub fn batch<
+        'a,
+        PC: Any + FnOnce(&'a Self) -> &'a mut [P],
+        P: Send + Sync + 'a,
+        SC: Any + FnOnce(&'a Self) -> S,
+        S: Send + Sync + 'a,
+        BC: Any + FnOnce(&'a Self) -> B,
+        B: Send + Sync + 'a,
+    >(
+        &'a self,
+        partition: PC,
+        state: SC,
+        broadcast: BC,
+    ) -> (&'a mut [P], &'a S, &'a [B]) {
+        with_local(|local| {
+            let part;
+            let state_ptr;
+            let broad;
+            if local.index == 0 {
+                part = partition(self);
+                unsafe {
+                    *local.global.broadcast_ptrs[0].get() = BroadcastPtr {
+                        ptr: &part as *const _ as *const _,
+                        id: TypeId::of::<PC>(),
+                    }
+                }
+
+                state_ptr = self.create_shared(state(self));
+
+                unsafe {
+                    *local.global.broadcast_ptrs[1].get() = BroadcastPtr {
+                        ptr: &state_ptr as *const _ as *const _,
+                        id: TypeId::of::<SC>(),
+                    };
+                }
+
+                broad = self.checkpoint.alloc_uninit::<B>(local.global.count);
+                unsafe {
+                    *local.global.broadcast_ptrs[2].get() = BroadcastPtr {
+                        ptr: &broad as *const _ as *const _,
+                        id: TypeId::of::<BC>(),
+                    };
+                }
+            }
+
+            local.global.share_barier.wait(Default::default());
+
+            let part = unsafe {
+                (*local.global.broadcast_ptrs[0].get())
+                    .downcast::<PC, *mut [P]>()
+                    .ok_or("partition")?
+            };
+
+            let state = unsafe {
+                (*local.global.broadcast_ptrs[1].get())
+                    .downcast::<SC, &S>()
+                    .ok_or("state")?
+            };
+
+            let broad = unsafe {
+                (*local.global.broadcast_ptrs[2].get())
+                    .downcast::<BC, *mut [B]>()
+                    .ok_or("broadcast")?
+            };
+            unsafe {
+                (broad as *mut B).add(local.index).write(broadcast(self))
+            };
+
+            // NOTE: some threads can panic on broadcast so we taks every thread with freeing its
+            // part, if they reach the drop they reach this, the slot is initialized
+            unsafe {
+                if core::mem::needs_drop::<B>() {
+                    struct Dropper<B>(*mut B);
+
+                    impl<B> Drop for Dropper<B> {
+                        fn drop(&mut self) {
+                            unsafe {
+                                core::ptr::drop_in_place(self.0);
+                            }
+                        }
+                    }
+
+                    self.create_shared(Dropper(
+                        (broad as *mut B).add(local.index),
+                    ));
+                }
+            }
+
+            local.global.share_barier.wait(Default::default());
+
+            let range =
+                task_slice_bounds(part.len(), local.global.count, local.index);
+
+            Ok::<_, &'static str>((
+                unsafe {
+                    core::slice::from_raw_parts_mut(
+                        (part as *mut P).add(range.start),
+                        range.len(),
+                    )
+                },
+                state,
+                unsafe { &*broad },
+            ))
+        })
+        .expect("type mismatch")
+    }
+
+    pub fn create_shared<'a, S>(&'a self, s: S) -> &'a mut S {
+        if core::mem::needs_drop::<S>() {
+            let state = self
+                .checkpoint
+                .create(EraseNode { s, _next: self.to_drop.take() });
+            let ptr = state as *mut _ as *mut _;
+            self.to_drop.set(Erased {
+                ptr,
+                drop_impl: unsafe {
+                    core::mem::transmute(
+                        core::ptr::drop_in_place::<EraseNode<S>>
+                            as unsafe fn(*mut EraseNode<S>),
+                    )
+                },
+            });
+            unsafe { &mut (*ptr.cast::<EraseNode<S>>()).s }
+        } else {
+            self.checkpoint.create(s)
+        }
+    }
+
+    pub fn broadcast<'a, I: Send + Sync + Any>(&self, input: I) -> &[I] {
+        self.batch(|_| -> &mut [()] { &mut [] }, |_| {}, move |_| input).2
+    }
+
+    pub fn share<'a, S: Send + Sync + Any>(&'a self, state: S) -> &'a S {
+        self.share_with(|ch| ch.create(state))
+    }
+
+    pub fn share_with<
+        'a,
+        SC: Any + FnOnce(&'a ScopeMemory) -> S,
+        S: Send + Sync + 'a,
+    >(
+        &'a self,
+        state: SC,
+    ) -> &'a S {
+        self.batch(|_| -> &mut [()] { &mut [] }, state, |_| {}).1
+    }
+
+    pub fn partition<
+        'a,
+        PC: Any + FnOnce(&'a ScopeMemory) -> &'a mut [P],
+        P: Send + Sync + 'a,
+    >(
+        &'a self,
+        partition: PC,
+    ) -> &'a mut [P] {
+        self.batch(partition, |_| {}, |_| {}).0
+    }
+}
+
+impl<'b> Deref for ScopeMemory<'b> {
+    type Target = Checkpoint<'b>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.checkpoint
+    }
+}
+
+pub struct Scope<'b> {
+    id: [u64; 2],
+    mem: ScopeMemory<'b>,
     prev_local: Option<LocalState>,
     pub group: u8,
 }
 
 impl<'b> Deref for Scope<'b> {
-    type Target = Checkpoint<'b>;
+    type Target = ScopeMemory<'b>;
 
     fn deref(&self) -> &Self::Target {
-        &self.checkpoint
+        &self.mem
     }
 }
 
@@ -176,397 +355,107 @@ pub fn scope_with_group_projection<'a>(
     checkpoint: Checkpoint<'a>,
     group_projection: Option<&[u8]>,
 ) -> Scope<'a> {
-    // NOTE: outside code can not reproduce the call here, they dont have access to the
-    // type id of this type so they can't call the broadcast to smuggle out the state we
-    // have here
-    struct TamperMarker;
-
-    #[derive(Clone)]
-    struct Smuggle(NonNull<Barrier>);
-
-    unsafe impl Send for Smuggle {}
-    unsafe impl Sync for Smuggle {}
-
     unsafe fn perform<'a, 'b>(
-        checkpoint: &'a Checkpoint,
-        to_drop: &Cell<Erased>,
+        mem: &'a ScopeMemory<'b>,
         groups: &[u8],
-    ) -> (u8, LocalState, NonNull<Barrier>) {
+    ) -> (u8, LocalState, [u64; 2]) {
         let index = index();
 
         let current = groups[index];
         let index = groups[..index].iter().filter(|&&v| v == current).count();
 
+        let pattern_len = groups.len();
         let mut pattern = [0u8; 256];
         pattern[..groups.len()].copy_from_slice(groups);
 
-        let (broad, shared, _) = unsafe {
-            batch_detached(
-                checkpoint,
-                to_drop,
-                pattern,
-                || {
-                    let group_count = groups
-                        .iter()
-                        .copied()
-                        .max()
-                        .expect("we absolutely have at least one lane")
-                        + 1;
+        let (_, shared, broad) = mem.batch(
+            |_| -> &mut [()] { &mut [] },
+            move |ch| {
+                let groups = &pattern[..pattern_len];
 
-                    let thread_counts = checkpoint
-                        .alloc_default::<u8>(group_count as usize)
-                        .unwrap();
-                    for &group in groups {
-                        thread_counts[group as usize] += 1;
-                    }
+                let group_count = groups
+                    .iter()
+                    .copied()
+                    .max()
+                    .expect("we absolutely have at least one lane")
+                    + 1;
 
-                    let slots = thread_counts
-                        .iter()
-                        .map(|&count| {
-                            (
-                                Arc::new(GlobalState::new(count as usize)),
-                                Smuggle(NonNull::from_ref(
-                                    checkpoint
-                                        .create(Barrier::new(count as usize)),
-                                )),
-                            )
-                        })
-                        .collect::<Vec<_>>();
+                let thread_counts =
+                    ch.alloc_default::<u8>(group_count as usize).unwrap();
+                for &group in groups {
+                    thread_counts[group as usize] += 1;
+                }
 
-                    create_shared(checkpoint, to_drop, slots).as_slice()
-                },
-                TamperMarker,
-                |_| -> &mut [TamperMarker] { &mut [] },
-            )
-        };
+                let mut elems = thread_counts.iter().map(|&count| {
+                    (
+                        Arc::new(GlobalState::new(count as usize)),
+                        next_scope_id(),
+                    )
+                });
 
-        let (global, Smuggle(barrier)) = shared[current as usize].clone();
+                let slots = ch.alloc_with(thread_counts.len(), || {
+                    elems.next().expect("we have the same length")
+                });
+
+                slots
+            },
+            move |_| pattern,
+        );
+
+        let (global, id) = &shared[current as usize];
 
         if !broad.iter().all(|&v| v == broad[index]) {
             // NOTE: this is required and also sound since we just successfully broadcasted
             // with a private type
-            with_local(|l| l.global.share_barier.wait());
+            with_local(|l| l.global.share_barier.wait(Default::default()));
             panic!("projection mismatch");
         }
 
         (
             current,
-            with_local(|l| core::mem::replace(l, LocalState { global, index })),
-            barrier,
+            with_local(|l| {
+                core::mem::replace(
+                    l,
+                    LocalState { global: global.clone(), index },
+                )
+            }),
+            *id,
         )
     }
 
+    fn next_scope_id() -> [u64; 2] {
+        static SCOPE_ID: Mutex<u128> = Mutex::new(0);
+        let mut id =
+            SCOPE_ID.lock().expect("addition does not panic in this universe");
+        *id += 1;
+        [(*id >> 64) as u64, *id as u64]
+    }
+
+    let mem = ScopeMemory { to_drop: Default::default(), checkpoint };
     let mut prev_local = None;
     let mut group = 0;
-    let bariera;
-    let to_drop = Default::default();
+    let id;
     if let Some(group_projection) = group_projection {
-        let (new_group, new_prev_local, barier) =
-            unsafe { perform(&checkpoint, &to_drop, group_projection) };
+        let (new_group, new_prev_local, new_id) =
+            unsafe { perform(&mem, group_projection) };
         group = new_group;
         prev_local = Some(new_prev_local);
-        bariera = barier;
+        id = new_id;
     } else {
-        let count = count();
-        bariera = unsafe {
-            NonNull::from_ref(
-                batch_detached(
-                    &checkpoint,
-                    &to_drop,
-                    (),
-                    || checkpoint.create(Barrier::new(count)),
-                    TamperMarker,
-                    |_| -> &mut [TamperMarker] { &mut [] },
-                )
-                .1,
-            )
-        }
+        id = *mem.share_with(move |_| next_scope_id());
     }
 
-    Scope { checkpoint, to_drop, prev_local, group, sync_barier: bariera }
-}
-
-pub unsafe fn create_shared<'a, S>(
-    checkpoint: &'a Checkpoint,
-    head: &Cell<Erased>,
-    s: S,
-) -> &'a mut S {
-    if core::mem::needs_drop::<S>() {
-        let state = checkpoint.create(EraseNode { s, _next: head.take() });
-        let ptr = state as *mut _ as *mut _;
-        head.set(Erased {
-            ptr,
-            drop_impl: unsafe {
-                core::mem::transmute(
-                    core::ptr::drop_in_place::<EraseNode<S>>
-                        as unsafe fn(*mut EraseNode<S>),
-                )
-            },
-        });
-        unsafe { &mut (*ptr.cast::<EraseNode<S>>()).s }
-    } else {
-        checkpoint.create(s)
-    }
-}
-
-/// # Safety
-///
-/// Caller must guarantee the `checkpoint` is dropped after `to_drop`
-pub unsafe fn batch_detached_<
-    'a,
-    BC: Any + FnOnce(&'a Checkpoint) -> B,
-    B: Send + Sync,
-    SC: Any + FnOnce(&'a Checkpoint) -> S,
-    S: Send + Sync,
-    PC: Any + FnOnce(&'a Checkpoint) -> &'a mut [P],
-    P: Send + Sync,
->(
-    checkpoint: &'a Checkpoint,
-    to_drop: &Cell<Erased>,
-    partition: PC,
-    state: SC,
-    broadcast: BC,
-) -> (&'a [B], &'a S, &'a mut [P]) {
-    with_local(|local| {
-        let part;
-        let state_ptr;
-        let broad;
-        if local.index == 0 {
-            part = unsafe {
-                create_shared(checkpoint, to_drop, partition(checkpoint))
-            };
-            unsafe {
-                *local.global.broadcast_ptrs[0].get() = BroadcastPtr {
-                    ptr: &part as *const _ as *const _,
-                    id: TypeId::of::<PC>(),
-                }
-            }
-
-            state_ptr = unsafe {
-                create_shared(checkpoint, to_drop, state(checkpoint))
-            };
-
-            unsafe {
-                *local.global.broadcast_ptrs[1].get() = BroadcastPtr {
-                    ptr: &state_ptr as *const _ as *const _,
-                    id: TypeId::of::<SC>(),
-                };
-            }
-
-            broad = checkpoint.alloc_uninit::<B>(local.global.count);
-            unsafe {
-                *local.global.broadcast_ptrs[2].get() = BroadcastPtr {
-                    ptr: &broad as *const _ as *const _,
-                    id: TypeId::of::<BC>(),
-                };
-            }
-        }
-
-        local.global.share_barier.wait();
-
-        let part = unsafe {
-            (*local.global.broadcast_ptrs[0].get())
-                .downcast::<PC, *mut [P]>()
-                .ok_or("partition")?
-        };
-
-        let state = unsafe {
-            (*local.global.broadcast_ptrs[1].get())
-                .downcast::<SC, &S>()
-                .ok_or("state")?
-        };
-
-        let broad = unsafe {
-            (*local.global.broadcast_ptrs[2].get())
-                .downcast::<BC, *mut [B]>()
-                .ok_or("broadcast")?
-        };
-        unsafe {
-            (broad as *mut B).add(local.index).write(broadcast(checkpoint))
-        };
-
-        // NOTE: some threads can panic on broadcast so we taks every thread with freeing its
-        // part, if they reach the drop they reach this, the slot is initialized
-        unsafe {
-            if core::mem::needs_drop::<B>() {
-                struct Dropper<B>(*mut B);
-
-                impl<B> Drop for Dropper<B> {
-                    fn drop(&mut self) {
-                        unsafe {
-                            core::ptr::drop_in_place(self.0);
-                        }
-                    }
-                }
-
-                create_shared(
-                    checkpoint,
-                    to_drop,
-                    Dropper((broad as *mut B).add(local.index)),
-                );
-            }
-        }
-
-        local.global.share_barier.wait();
-
-        let range =
-            task_slice_bounds(part.len(), local.global.count, local.index);
-
-        Ok::<_, &'static str>((unsafe { &*broad }, state, unsafe {
-            core::slice::from_raw_parts_mut(
-                (part as *mut P).add(range.start),
-                range.len(),
-            )
-        }))
-    })
-    .expect("type mismatch")
-}
-
-/// # Safety
-///
-/// Caller must guarantee the `checkpoint` is dropped after `to_drop`
-pub unsafe fn batch_detached<
-    'a,
-    B: Sync + Send + Any,
-    S: Sync + Send + Any + ?Sized,
-    SP,
-    P: Send + Sync + Any,
->(
-    checkpoint: &'a Checkpoint,
-    to_drop: &Cell<Erased>,
-    broadcast: B,
-    state: impl FnOnce() -> &'a S,
-    partition: SP,
-    compute: impl FnOnce(&mut SP) -> &mut [P],
-) -> (&'a [B], &'a S, &'a mut [P]) {
-    with_local(|local| {
-        let part;
-        let state_ptr;
-        let broad;
-        if local.index == 0 {
-            let partition_state =
-                unsafe { create_shared(checkpoint, to_drop, partition) };
-
-            part = compute(partition_state);
-            unsafe {
-                *local.global.broadcast_ptrs[0].get() = BroadcastPtr {
-                    ptr: &part as *const _ as *const _,
-                    id: TypeId::of::<P>(),
-                }
-            }
-
-            state_ptr = state();
-
-            unsafe {
-                *local.global.broadcast_ptrs[1].get() = BroadcastPtr {
-                    ptr: &state_ptr as *const _ as *const _,
-                    id: TypeId::of::<S>(),
-                };
-            }
-
-            broad = checkpoint.alloc_uninit::<B>(local.global.count);
-            unsafe {
-                *local.global.broadcast_ptrs[2].get() = BroadcastPtr {
-                    ptr: &broad as *const _ as *const _,
-                    id: TypeId::of::<B>(),
-                };
-            }
-        }
-
-        println!("in {:?}", local.index);
-
-        local.global.share_barier.wait();
-        println!("out {:?}", local.index);
-
-        let part = unsafe {
-            (*local.global.broadcast_ptrs[0].get())
-                .downcast::<P, *mut [P]>()
-                .ok_or("partition")?
-        };
-
-        let state = unsafe {
-            (*local.global.broadcast_ptrs[1].get())
-                .downcast::<S, &S>()
-                .ok_or("state")?
-        };
-
-        let broad = unsafe {
-            (*local.global.broadcast_ptrs[2].get())
-                .downcast::<B, *mut [B]>()
-                .ok_or("broadcast")?
-        };
-        unsafe { (broad as *mut B).add(local.index).write(broadcast) };
-
-        local.global.share_barier.wait();
-
-        let range =
-            task_slice_bounds(part.len(), local.global.count, local.index);
-
-        Ok::<_, &'static str>((unsafe { &*broad }, state, unsafe {
-            core::slice::from_raw_parts_mut(
-                (part as *mut P).add(range.start),
-                range.len(),
-            )
-        }))
-    })
-    .expect("type mismatch")
+    Scope { mem, prev_local, group, id }
 }
 
 impl<'b> Scope<'b> {
-    pub fn create_shared<S: 'static>(&self, s: S) -> &mut S {
-        unsafe { create_shared(&self.checkpoint, &self.to_drop, s) }
-    }
-
-    pub fn batch<
-        'a,
-        B: Sync + Send + Any,
-        S: Sync + Send + Any + ?Sized,
-        SP,
-        P: Send + Sync + Any,
-    >(
-        &'a self,
-        broadcast: B,
-        state: impl FnOnce() -> &'a S,
-        partition: SP,
-        compute: impl FnOnce(&mut SP) -> &mut [P],
-    ) -> (&'a [B], &'a S, &'a mut [P]) {
-        unsafe {
-            batch_detached(
-                &self.checkpoint,
-                &self.to_drop,
-                broadcast,
-                state,
-                partition,
-                compute,
-            )
-        }
-    }
-
-    pub fn broadcast<'a, I: Send + Sync + Any>(&self, input: I) -> &[I] {
-        self.batch(input, || &(), (), |_| -> &mut [()] { &mut [] }).0
-    }
-
-    pub fn share<'a, S: Send + Sync + Any>(&'a self, state: S) -> &'a S {
-        self.share_with(|| self.create_shared(state))
-    }
-
-    pub fn share_with<'a, S: Send + Sync + Any + ?Sized>(
-        &'a self,
-        state: impl FnOnce() -> &'a S,
-    ) -> &'a S {
-        self.batch((), state, (), |_| -> &mut [()] { &mut [] }).1
-    }
-
-    pub fn partition<'a, S, T: Send + Sync + Any>(
-        &'a self,
-        state: S,
-        compute: impl FnOnce(&mut S) -> &mut [T],
-    ) -> &'a mut [T] {
-        self.batch((), || &(), state, compute).2
-    }
-
     pub fn sync(&self) {
-        unsafe { self.sync_barier.as_ref().wait() };
+        with_local(|l| {
+            l.global.share_barier.wait(Usage {
+                object_id: self.id,
+                purpose_id: BARRIER_PURPOSE_SYNC,
+            })
+        });
     }
 }
 
@@ -576,61 +465,65 @@ impl Drop for Scope<'_> {
             with_local(|l| core::mem::swap(l, prev_local));
         }
 
-        self.sync();
+        // NOTE: we sync and then drop, this means that if user did not drop any of the scopes for
+        // some reason we deadlock, that makes this api sound, it also means the `mem` will remain
+        // valid, as far as I can tell there should not be any undefined behaviour
+        with_local(|l| {
+            self.prev_local
+                .as_ref()
+                .map_or(&l.global, |l| &l.global)
+                .share_barier
+                .wait(Usage {
+                    object_id: self.id,
+                    purpose_id: BARRIER_PURPOSE_DROP,
+                })
+        });
     }
 }
 
 #[cfg(test)]
 mod test {
     use {
-        crate::{Arna, Checkpoint, lane},
-        core::{
-            any::Any,
-            iter,
-            sync::atomic::{AtomicUsize, Ordering},
-        },
+        crate::{Arna, lane},
+        core::sync::atomic::{AtomicU16, Ordering},
     };
 
     #[test]
     pub fn sanity() {
-        lane::launch(2, || {
-            Arna::init_temp_arenas_with_boxes(1024 * 2);
+        lane::launch(16, || {
+            Arna::init_temp_arenas_with_boxes(1024 * 8);
 
             {
                 let scope = lane::scope(Arna::scratch(0));
 
-                let slice = scope.partition(vec![], |vck| {
-                    vck.extend(iter::repeat_n(1, 1024));
-                    &mut vck[..]
-                });
+                let slice =
+                    scope.partition(|ch| ch.alloc_with(1024, || 1).unwrap());
 
-                let sum = slice.iter().sum::<usize>();
+                let sum = slice.iter().sum::<u16>();
 
-                let accum2 = scope.share(AtomicUsize::new(0));
+                let accum2 = scope.share(AtomicU16::new(0));
 
                 accum2.fetch_add(sum, Ordering::Relaxed);
 
                 let accum1 = scope.broadcast(sum);
 
-                assert_eq!(accum1.iter().sum::<usize>(), 1024);
+                assert_eq!(accum1.iter().sum::<u16>(), 1024);
                 assert_eq!(accum2.load(Ordering::Relaxed), 1024);
 
                 {
                     enum GroupKind {
-                        Eaven(usize),
-                        Odd(usize),
+                        Eaven(u16),
+                        Odd(u16),
                     }
 
-                    let scratch = Arna::scratch(&*scope);
+                    let scratch = Arna::scratch(&**scope);
                     let split_scope =
                         lane::scope_group_with(scratch, |i| i % 2);
 
-                    let slice = scope.partition(vec![], |vck| {
-                        vck.extend(iter::repeat_n(1, 1024));
-                        &mut vck[..]
-                    });
+                    let slice = scope
+                        .partition(|ch| ch.alloc_with(1024, || 1).unwrap());
 
-                    let sum = slice.iter().sum::<usize>();
+                    let sum = slice.iter().sum::<u16>();
 
                     let kind = match split_scope.group == 0 {
                         true => GroupKind::Eaven(sum),
@@ -674,7 +567,7 @@ mod test {
             if lane::index() == 0 {
                 scope.sync();
             } else {
-                scope.partition((), |_| -> &mut [()] { &mut [] });
+                scope.partition(|_| -> &mut [()] { &mut [] });
             }
         });
     }
@@ -772,16 +665,15 @@ mod test {
             let scope = lane::scope(Arna::scratch(0));
             if lane::index() == 0 {
                 let group =
-                    lane::scope_group_with(Arna::scratch(&*scope), |i| i);
+                    lane::scope_group_with(Arna::scratch(&**scope), |i| i);
                 drop(group);
                 scope.sync();
             } else {
                 let stolen: &[Arc<lane::GlobalState>] = scope
                     .batch(
-                        [0u8; 256],
-                        || -> &[Arc<lane::GlobalState>] { &[] },
-                        (), // no longer possible
                         |_| -> &mut [()] { &mut [] },
+                        |_| -> &[Arc<lane::GlobalState>] { &[] },
+                        |_| [0u8; 256],
                     )
                     .1;
                 scope.sync();
@@ -801,17 +693,13 @@ mod test {
             let scope = lane::scope(Arna::scratch(0));
 
             if lane::index() == 0 {
-                let slice = scope.partition(vec![], |vck| {
-                    vck.extend(iter::repeat_n(1u8, 1024));
-                    &mut vck[..]
-                });
+                let slice =
+                    scope.partition(|ch| ch.alloc_with(16, || 1).unwrap());
 
                 slice.fill(10);
             } else {
-                let slice = scope.partition(vec![], |vck| {
-                    vck.extend(iter::repeat_n(1usize, 1024));
-                    &mut vck[..]
-                });
+                let slice =
+                    scope.partition(|ch| ch.alloc_with(16, || 1).unwrap());
 
                 slice.fill(10);
             }
@@ -825,12 +713,9 @@ mod test {
             Arna::init_temp_arenas_with_boxes(128 * 2);
 
             let scope = lane::scope(Arna::scratch(0));
-            let scope2 = lane::scope(Arna::scratch(&*scope));
+            let scope2 = lane::scope(Arna::scratch(&**scope));
 
-            let slice = scope2.partition(vec![], |vck| {
-                vck.extend(iter::repeat_n(1usize, 1024));
-                &mut vck[..]
-            });
+            let slice = scope2.partition(|ch| ch.alloc_with(16, || 1).unwrap());
 
             if lane::index() == 0 {
                 drop(scope2);
