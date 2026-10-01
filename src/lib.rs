@@ -373,7 +373,13 @@ impl<'a> Arna<'a> {
     pub fn init_temp_arenas(slots: [Arna<'static>; 2]) {
         // SAFETY: the drop of the previous arenas will panic if any checkpoints are still
         // active
-        TEMP_ARENAS.with(|old_slots| unsafe { *old_slots.get() = slots })
+        TEMP_ARENAS.with(|old_slots| {
+            unsafe {
+                (*old_slots.get())[0].is_thread_local = false;
+                (*old_slots.get())[1].is_thread_local = false;
+            }
+            unsafe { *old_slots.get() = slots }
+        })
     }
 
     #[cfg(feature = "std")]

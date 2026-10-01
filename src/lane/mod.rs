@@ -32,8 +32,20 @@ impl Default for BroadcastPtr {
 
 pub struct GlobalState {
     broadcast_ptrs: [UnsafeCell<BroadcastPtr>; 3],
-    barrier: Barrier,
+    share_barier: Barrier,
+    sync_barier: Barrier,
     count: usize,
+}
+
+impl GlobalState {
+    pub fn new(count: usize) -> Self {
+        Self {
+            broadcast_ptrs: Default::default(),
+            share_barier: Barrier::new(count),
+            sync_barier: Barrier::new(count),
+            count,
+        }
+    }
 }
 
 unsafe impl Send for GlobalState {}
@@ -50,11 +62,7 @@ thread_local! {
 
 pub fn launch(lane_count: usize, main: impl Fn() + Sync + Send) {
     let main = &main;
-    let global_state = Arc::new(GlobalState {
-        broadcast_ptrs: Default::default(),
-        barrier: Barrier::new(lane_count),
-        count: lane_count,
-    });
+    let global_state = Arc::new(GlobalState::new(lane_count));
     std::thread::scope(|t| {
         for lane_index in 0..lane_count {
             let global = global_state.clone();
@@ -202,13 +210,7 @@ pub fn scope_with_group_projection<'a>(
 
                     let slots = thread_counts
                         .iter()
-                        .map(|&count| {
-                            Arc::new(GlobalState {
-                                broadcast_ptrs: Default::default(),
-                                barrier: Barrier::new(count),
-                                count,
-                            })
-                        })
+                        .map(|&count| Arc::new(GlobalState::new(count)))
                         .collect::<Vec<_>>();
 
                     create_shared(checkpoint, to_drop, slots).as_slice()
@@ -224,9 +226,9 @@ pub fn scope_with_group_projection<'a>(
         (
             current,
             with_local(|l| {
-                l.global.barrier.wait();
+                l.global.sync_barier.wait();
                 let vl = core::mem::replace(l, LocalState { global, index });
-                l.global.barrier.wait();
+                l.global.sync_barier.wait();
                 vl
             }),
         )
@@ -321,7 +323,7 @@ pub unsafe fn batch_detached<
 
         println!("in {:?}", local.index);
 
-        local.global.barrier.wait();
+        local.global.share_barier.wait();
         println!("out {:?}", local.index);
 
         let part = unsafe {
@@ -343,7 +345,7 @@ pub unsafe fn batch_detached<
         };
         unsafe { (broad as *mut B).add(local.index).write(broadcast) };
 
-        local.global.barrier.wait();
+        local.global.share_barier.wait();
 
         let range =
             task_slice_bounds(part.len(), local.global.count, local.index);
@@ -412,7 +414,7 @@ impl<'b> Scope<'b> {
     }
 
     pub fn sync(&self) {
-        with_local(|l| l.global.barrier.wait());
+        with_local(|l| l.global.sync_barier.wait());
     }
 }
 
@@ -465,6 +467,76 @@ mod test {
                     let split_scope =
                         lane::scope_group_with(scratch, |i| i % 2);
                 }
+            }
+        });
+    }
+
+    /// UB vector #1: barrier cross-pairing exposes uninitialized slots.
+    ///
+    /// `sync()` performs a bare `barrier.wait()` on the same `Barrier` that
+    /// `batch_detached` uses internally, so a lane that only calls `sync()`
+    /// releases another lane's `batch` barrier *without lane 0 ever writing
+    /// the broadcast slots*. The slots hold `BroadcastPtr::default()` whose
+    /// `id` is `TypeId::of::<()>()` and whose `ptr` is null, so a batch with
+    /// `P = ()` passes the `downcast` TypeId check and dereferences null.
+    #[ignore = "demonstrates UB (null deref): cargo miri test -- --ignored unsound_null_broadcast_slot"]
+    #[test]
+    pub fn unsound_null_broadcast_slot() {
+        lane::launch(2, || {
+            Arna::init_temp_arenas_with_boxes(1024 * 2);
+            let scope = lane::scope(Arna::scratch(0));
+            if lane::index() == 0 {
+                scope.sync();
+            } else {
+                scope.partition((), |_| -> &mut [()] { &mut [] });
+            }
+        });
+    }
+
+    /// UB vector #2: use-after-free via thread-local arena reinitialization.
+    ///
+    /// `Arna::drop` skips the "all checkpoints need to be dropped" assert
+    /// when `is_thread_local` is set, and `init_temp_arenas_with_boxes`
+    /// sets exactly that flag. Reinitializing while a `Scope` is alive frees
+    /// the arena's backing box even though `create_shared` results and the
+    /// scope's `Erased` drop chain still point into it.
+    #[ignore = "demonstrates UB (use-after-free): cargo miri test -- --ignored unsound_arena_reinit_uaf"]
+    #[test]
+    pub fn unsound_arena_reinit_uaf() {
+        lane::launch(1, || {
+            Arna::init_temp_arenas_with_boxes(1024 * 2);
+            let scope = lane::scope(Arna::scratch(0));
+            let shared = scope.create_shared(String::from("hello"));
+            Arna::init_temp_arenas_with_boxes(1024 * 2);
+            let _ = shared.len();
+            drop(scope);
+        });
+    }
+
+    /// UB vector #3: divergent scope drop desynchronizes the barrier protocol.
+    ///
+    /// Barriers do not distinguish call sites: lane 0's `Scope::drop` sync
+    /// pairs with lane 1's next `batch` barrier. Lane 1 then reads stale
+    /// broadcast slots while lane 0 (already past the drop, in a new scope's
+    /// batch) concurrently writes them through the `UnsafeCell` — a data
+    /// race with no happens-before edge. Additionally lane 1's stale `broad`
+    /// pointer aliases lane 0's arena memory that was reset by the dropped
+    /// checkpoint, and lane 0 reads `broad[1]` that lane 1 never initialized.
+    #[ignore = "demonstrates UB (data race + uninit read): cargo miri test -- --ignored unsound_divergent_scope_drop_race"]
+    #[test]
+    pub fn unsound_divergent_scope_drop_race() {
+        lane::launch(2, || {
+            Arna::init_temp_arenas_with_boxes(1024 * 2);
+            if lane::index() == 0 {
+                let scope = lane::scope(Arna::scratch(0));
+                scope.broadcast(0u8);
+                drop(scope);
+                let scope2 = lane::scope(Arna::scratch(0));
+                scope2.broadcast(1u8);
+            } else {
+                let scope = lane::scope(Arna::scratch(0));
+                scope.broadcast(2u8);
+                scope.broadcast(3u8);
             }
         });
     }
