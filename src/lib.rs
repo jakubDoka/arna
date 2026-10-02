@@ -80,6 +80,8 @@ pub struct Checkpoint<'a> {
     arna: NonNull<Arna<'a>>,
     prev_pos: usize,
     depth: u32,
+    // TODO: make this optional, some ppl dont care if this bombs the process
+    is_temp: bool,
 }
 
 impl<'a> Checkpoint<'a> {
@@ -229,7 +231,7 @@ pub fn panicking() -> bool {
 
 impl Drop for Checkpoint<'_> {
     fn drop(&mut self) {
-        if !panicking() {
+        if !panicking() || self.is_temp {
             let arna = unsafe { self.get_inner() };
             arna.pos.set(self.prev_pos);
             arna.depth.update(|d| d - 1);
@@ -307,7 +309,6 @@ pub struct Arna<'a> {
     ptr: *mut u8,
     cap: usize,
     depth: Cell<u32>,
-    is_thread_local: bool,
 
     borrow: PhantomData<&'a mut [u8]>,
     _unpin: PhantomPinned,
@@ -362,7 +363,10 @@ impl<'a> Arna<'a> {
             let refr = unsafe { &*arenas.get() };
             for vl in refr {
                 if vl as *const _ as *const _ != clobber {
-                    return unsafe { Pin::new_unchecked(vl).checkpoint_ref() };
+                    let mut check =
+                        unsafe { Pin::new_unchecked(vl).checkpoint_ref() };
+                    check.is_temp = true;
+                    return check;
                 }
             }
             unreachable!()
@@ -375,9 +379,17 @@ impl<'a> Arna<'a> {
         // active
         TEMP_ARENAS.with(|old_slots| {
             unsafe {
-                (*old_slots.get())[0].is_thread_local = false;
-                (*old_slots.get())[1].is_thread_local = false;
+                let arr = &*old_slots.get();
+                for ar in arr {
+                    assert_eq!(
+                        ar.depth.get(),
+                        0,
+                        "can't set the arenas when there are \
+                        still checkpoints alive"
+                    )
+                }
             }
+
             unsafe { *old_slots.get() = slots }
         })
     }
@@ -385,11 +397,9 @@ impl<'a> Arna<'a> {
     #[cfg(feature = "std")]
     pub fn init_temp_arenas_with_boxes(cap: usize) {
         Self::init_temp_arenas(core::array::from_fn(|_| {
-            let mut arna = Arna::from(
+            Arna::from(
                 vec![MaybeUninit::<u8>::uninit(); cap].into_boxed_slice(),
-            );
-            arna.is_thread_local = true;
-            arna
+            )
         }));
     }
 
@@ -421,6 +431,7 @@ impl<'a> Arna<'a> {
             arna: self.get_ref().into(),
             depth: self.depth.get(),
             prev_pos: self.pos.get(),
+            is_temp: false,
         }
     }
 
@@ -581,7 +592,6 @@ impl Arna<'static> {
             }),
             pos: 0.into(),
             depth: 0.into(),
-            is_thread_local: false,
             borrow: PhantomData,
             _unpin: PhantomPinned,
         }
@@ -591,7 +601,7 @@ impl Arna<'static> {
 impl Drop for Arna<'_> {
     fn drop(&mut self) {
         assert!(
-            panicking() || self.depth.get() == 0 || self.is_thread_local,
+            panicking() || self.depth.get() == 0,
             "all checkpoins need to be dropped"
         );
         let _mem = slice_from_raw_parts_mut(self.ptr, self.cap);

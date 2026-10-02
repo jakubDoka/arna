@@ -12,11 +12,7 @@ struct BarrierState {
     usage: Usage,
 }
 
-#[derive(Default, PartialEq, Eq, Debug)]
-pub struct Usage {
-    pub object_id: [u64; 2],
-    pub purpose_id: u64,
-}
+pub type Usage = u64;
 
 impl Barrier {
     pub fn new(n: usize) -> Barrier {
