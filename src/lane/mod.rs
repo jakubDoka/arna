@@ -1,5 +1,5 @@
 use {
-    crate::{Arna, Checkpoint},
+    crate::{Arna, Checkpoint, OwnedSlice},
     alloc::sync::Arc,
     barrier::Barrier,
     core::{
@@ -138,37 +138,40 @@ impl<'b> ScopeMemory<'b> {
     /// Caller must guarantee the `checkpoint` is dropped after `to_drop`
     pub fn batch<
         'a,
-        PC: Any + FnOnce(&'a Self) -> &'a mut [P],
-        P: Send + Sync + 'a,
-        SC: Any + FnOnce(&'a Self) -> S,
-        S: Send + Sync + 'a,
-        BC: Any + FnOnce(&'a Self) -> B,
-        B: Send + Sync + 'a,
+        PC: FnMut() -> &'a mut [P],
+        P: Send + Sync + Any,
+        SC: FnOnce() -> &'a S,
+        S: Send + Sync + Any + ?Sized,
+        B: Send + Sync + Any,
     >(
         &'a self,
-        partition: PC,
+        mut partition: PC,
         state: SC,
-        broadcast: BC,
+        broadcast: B,
     ) -> (&'a mut [P], &'a S, &'a [B]) {
+        if true {
+            panic!("this is useless and broken");
+        }
+
         with_local(self.depth, |local| {
             let part;
             let state_ptr;
             let broad;
             if local.index == 0 {
-                part = partition(self);
+                part = partition();
                 unsafe {
                     *local.global.broadcast_ptrs[0].get() = BroadcastPtr {
                         ptr: &part as *const _ as *const _,
-                        id: TypeId::of::<PC>(),
+                        id: TypeId::of::<P>(),
                     }
                 }
 
-                state_ptr = self.create_shared(state(self));
+                state_ptr = state();
 
                 unsafe {
                     *local.global.broadcast_ptrs[1].get() = BroadcastPtr {
                         ptr: &state_ptr as *const _ as *const _,
-                        id: TypeId::of::<SC>(),
+                        id: TypeId::of::<S>(),
                     };
                 }
 
@@ -176,7 +179,7 @@ impl<'b> ScopeMemory<'b> {
                 unsafe {
                     *local.global.broadcast_ptrs[2].get() = BroadcastPtr {
                         ptr: &broad as *const _ as *const _,
-                        id: TypeId::of::<BC>(),
+                        id: TypeId::of::<B>(),
                     };
                 }
             }
@@ -188,27 +191,25 @@ impl<'b> ScopeMemory<'b> {
 
             let part = unsafe {
                 (*local.global.broadcast_ptrs[0].get())
-                    .downcast::<PC, *mut [P]>()
+                    .downcast::<P, *mut [P]>()
                     .ok_or("partition")
             };
 
             let state = unsafe {
                 (*local.global.broadcast_ptrs[1].get())
-                    .downcast::<SC, &S>()
+                    .downcast::<S, &S>()
                     .ok_or("state")
             };
 
             let broad = unsafe {
                 (*local.global.broadcast_ptrs[2].get())
-                    .downcast::<BC, *mut [B]>()
+                    .downcast::<B, *mut [B]>()
                     .ok_or("broadcast")
             };
 
             let (part, state, broad) = (part?, state?, broad?);
 
-            unsafe {
-                (broad as *mut B).add(local.index).write(broadcast(self))
-            };
+            unsafe { (broad as *mut B).add(local.index).write(broadcast) };
 
             local
                 .global
@@ -217,16 +218,6 @@ impl<'b> ScopeMemory<'b> {
 
             if local.index == 0 {
                 if core::mem::needs_drop::<B>() {
-                    struct Dropper<B>(*mut [B]);
-
-                    impl<B> Drop for Dropper<B> {
-                        fn drop(&mut self) {
-                            unsafe {
-                                core::ptr::drop_in_place(self.0);
-                            }
-                        }
-                    }
-
                     self.create_shared(Dropper(broad));
                 }
             }
@@ -248,11 +239,23 @@ impl<'b> ScopeMemory<'b> {
         .expect("type mismatch")
     }
 
-    pub fn create_shared<'a, S>(&'a self, s: S) -> &'a mut S {
+    pub fn create_shared_slice<'a, T: 'static>(
+        &'a self,
+        s: OwnedSlice<'a, T>,
+    ) -> &'a mut [T] {
+        let slice = s.leak();
+
+        self.create_shared(Dropper(slice as *mut _));
+
+        slice
+    }
+
+    pub fn create_shared<'a, S: 'static>(&'a self, s: S) -> &'a mut S {
         if core::mem::needs_drop::<S>() {
             let state = self
                 .checkpoint
-                .create(EraseNode { s, _next: self.to_drop.take() });
+                .create_uninit()
+                .write(EraseNode { s, _next: self.to_drop.take() });
             let ptr = state as *mut _ as *mut _;
             self.to_drop.set(Erased {
                 ptr,
@@ -270,35 +273,48 @@ impl<'b> ScopeMemory<'b> {
     }
 
     pub fn broadcast<'a, I: Send + Sync + Any>(&self, input: I) -> &[I] {
-        self.batch(|_| -> &mut [()] { &mut [] }, |_| {}, move |_| input).2
+        self.batch(|| -> &mut [()] { &mut [] }, || &(), input).2
     }
 
     pub fn share<'a, S: Send + Sync + Any>(&'a self, state: S) -> &'a S {
-        self.share_with(|ch| ch.create(state))
+        self.share_with(|| self.create_shared(state))
     }
 
     pub fn share_with<
         'a,
-        SC: Any + FnOnce(&'a ScopeMemory) -> S,
-        S: Send + Sync + 'a,
+        SC: FnOnce() -> &'a S,
+        S: Send + Sync + Any + ?Sized,
     >(
         &'a self,
         state: SC,
     ) -> &'a S {
-        self.batch(|_| -> &mut [()] { &mut [] }, state, |_| {}).1
+        self.batch(|| -> &mut [()] { &mut [] }, state, || {}).1
     }
 
     pub fn partition<
         'a,
-        PC: Any + FnOnce(&'a ScopeMemory) -> &'a mut [P],
-        P: Send + Sync + 'a,
+        PC: FnMut() -> &'a mut [P],
+        P: Send + Sync + 'static,
     >(
         &'a self,
         partition: PC,
     ) -> &'a mut [P] {
-        self.batch(partition, |_| {}, |_| {}).0
+        self.batch(partition, || &(), || {}).0
     }
 }
+
+struct Dropper<B>(*mut [B]);
+
+impl<B> Drop for Dropper<B> {
+    fn drop(&mut self) {
+        unsafe {
+            core::ptr::drop_in_place(self.0);
+        }
+    }
+}
+
+unsafe impl<B: Send> Send for Dropper<B> {}
+unsafe impl<B: Sync> Sync for Dropper<B> {}
 
 impl<'b> Deref for ScopeMemory<'b> {
     type Target = Checkpoint<'b>;
@@ -386,12 +402,9 @@ pub fn scope_with_group_projection<'a>(
         let current = groups[index];
         let index = groups[..index].iter().filter(|&&v| v == current).count();
 
-        let groups = groups as *const [usize];
-
         let (_, shared, broad) = mem.batch(
-            |_| -> &mut [()] { &mut [] },
-            move |ch| {
-                let groups = unsafe { &*groups };
+            || -> &mut [()] { &mut [] },
+            move || {
                 let group_count = groups
                     .iter()
                     .copied()
@@ -400,7 +413,7 @@ pub fn scope_with_group_projection<'a>(
                     + 1;
 
                 let thread_counts =
-                    ch.alloc_default::<u8>(group_count as usize).unwrap();
+                    mem.alloc_default::<u8>(group_count as usize).unwrap();
                 for &group in groups {
                     thread_counts[group as usize] += 1;
                 }
@@ -409,20 +422,28 @@ pub fn scope_with_group_projection<'a>(
                     .iter()
                     .map(|&count| Arc::new(GlobalState::new(count as usize)));
 
-                let slots = ch.alloc_with(thread_counts.len(), || {
-                    elems.next().expect("we have the same length")
-                });
+                let slots: OwnedSlice<'a, _> = mem
+                    .alloc_with(thread_counts.len(), || {
+                        elems.next().expect("we have the same length")
+                    });
 
-                slots
+                mem.create_shared_slice(slots)
             },
-            move |ch| &*ch.alloc(unsafe { &*groups }),
+            {
+                // SAFETY: we dont let this escape past the lifetime of &'a self and so the
+                // reference allocated on the selfs arena should be valid in the following code.
+                struct Smuggle(*const [usize]);
+
+                unsafe impl Send for Smuggle {}
+                unsafe impl Sync for Smuggle {}
+
+                Smuggle(mem.alloc(groups))
+            },
         );
 
-        let global = &shared[current as usize];
+        let global = shared[current as usize].clone();
 
-        if !broad[1..].iter().all(|&v| v == broad[0]) {
-            // NOTE: this is required and also sound since we just successfully broadcasted
-            // with a private type
+        if !broad[1..].iter().all(|v| unsafe { *v.0 == *broad[0].0 }) {
             with_local(mem.depth, |l| {
                 l.global
                     .share_barier
@@ -436,11 +457,7 @@ pub fn scope_with_group_projection<'a>(
             with_local(mem.depth, |l| {
                 core::mem::replace(
                     l,
-                    LocalState {
-                        global: global.clone(),
-                        index,
-                        depth: l.depth,
-                    },
+                    LocalState { global, index, depth: l.depth },
                 )
             }),
         )
@@ -510,7 +527,7 @@ mod test {
                 let scope = lane::scope(Arna::scratch(0));
 
                 let slice =
-                    scope.partition(|ch| ch.alloc_with(1024, || 1).unwrap());
+                    scope.partition(|| scope.alloc_with(1024, || 1).unwrap());
 
                 let sum = slice.iter().sum::<u16>();
 
@@ -533,8 +550,9 @@ mod test {
                     let split_scope =
                         lane::scope_group_with(scratch, |i| i % 2);
 
-                    let slice = split_scope
-                        .partition(|ch| ch.alloc_with(1024, || 1).unwrap());
+                    let slice = split_scope.partition(|| {
+                        split_scope.alloc_with(1024, || 1).unwrap()
+                    });
 
                     let sum = slice.iter().sum::<u16>();
 
@@ -563,6 +581,63 @@ mod test {
         });
     }
 
+    /// `create_shared` moves the existing drop chain into the value passed to
+    /// the arena before allocating space for it. If that allocation panics,
+    /// unwinding drops the chain while references to its values remain live.
+    #[ignore = "demonstrates UB (use-after-free): cargo miri test --lib lane::test::unsound_create_shared_oom_uaf -- --ignored --exact"]
+    #[test]
+    fn unsound_create_shared_oom_uaf() {
+        let node_size = core::mem::size_of::<lane::EraseNode<String>>();
+        let node_align = core::mem::align_of::<lane::EraseNode<String>>();
+
+        lane::launch(1, || {
+            // The first node fits regardless of the backing allocation's
+            // alignment, but there is not enough room for a second node.
+            Arna::init_temp_arenas_with_boxes(node_size + node_align - 1);
+            let scope = lane::scope(Arna::scratch(0));
+            let shared = scope.create_shared(String::from("still live"));
+
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    scope.create_shared(String::from("forces OOM"));
+                }));
+            assert!(result.is_err());
+
+            // Safe Rust still considers `shared` live, but unwinding the
+            // failed allocation has already destroyed its String.
+            std::hint::black_box(shared.as_bytes()[0]);
+        });
+    }
+
+    /// Values created earlier are dropped after values created later. Safe
+
+    /// interior mutability can make an earlier destructor borrow a later value,
+    /// so the destructor observes that value after it has been destroyed.
+    #[cfg(false)]
+    #[ignore = "demonstrates UB (use-after-free): cargo miri test --lib lane::test::unsound_create_shared_drop_order_uaf -- --ignored --exact"]
+    #[test]
+    fn unsound_create_shared_drop_order_uaf() {
+        struct Observer<'a>(std::sync::Mutex<Option<&'a String>>);
+
+        impl Drop for Observer<'_> {
+            fn drop(&mut self) {
+                std::hint::black_box(
+                    self.0.lock().unwrap().unwrap().as_bytes()[0],
+                );
+            }
+        }
+
+        lane::launch(1, || {
+            Arna::init_temp_arenas_with_boxes(4096);
+            let scope = lane::scope(Arna::scratch(0));
+            let observer = scope.share_with(|| Observer(Default::default()));
+            let observed = scope.share_with(|| String::from("dropped first"));
+            *observer.0.lock().unwrap() = Some(observed);
+
+            drop(scope);
+        });
+    }
+
     /// UB vector #1: barrier cross-pairing exposes uninitialized slots.
     ///
     /// `sync()` performs a bare `barrier.wait()` on the same `Barrier` that
@@ -580,7 +655,7 @@ mod test {
             if lane::index() == 0 {
                 scope.sync();
             } else {
-                scope.partition(|_| -> &mut [()] { &mut [] });
+                scope.partition(|| -> &mut [()] { &mut [] });
             }
         });
     }
@@ -684,9 +759,9 @@ mod test {
             } else {
                 let stolen: &[Arc<lane::GlobalState>] = scope
                     .batch(
-                        |_| -> &mut [()] { &mut [] },
-                        |_| -> &[Arc<lane::GlobalState>] { &[] },
-                        |_| [0u8; 256],
+                        || -> &mut [()] { &mut [] },
+                        || -> &[Arc<lane::GlobalState>] { &[] },
+                        || [0u8; 256],
                     )
                     .1;
                 scope.sync();
@@ -811,12 +886,12 @@ mod test {
 
             if lane::index() == 0 {
                 let slice =
-                    scope.partition(|ch| ch.alloc_with(16, || 1).unwrap());
+                    scope.partition(|| scope.alloc_with(16, || 1).unwrap());
 
                 slice.fill(10);
             } else {
                 let slice =
-                    scope.partition(|ch| ch.alloc_with(16, || 1).unwrap());
+                    scope.partition(|| scope.alloc_with(16, || 1).unwrap());
 
                 slice.fill(10);
             }
@@ -832,7 +907,8 @@ mod test {
             let scope = lane::scope(Arna::scratch(0));
             let scope2 = lane::scope(Arna::scratch(&**scope));
 
-            let slice = scope2.partition(|ch| ch.alloc_with(16, || 1).unwrap());
+            let slice =
+                scope2.partition(|| scope2.alloc_with(16, || 1).unwrap());
 
             if lane::index() == 0 {
                 drop(scope2);
